@@ -1,5 +1,14 @@
+diff --git a/debian/jellyfin-ffmpeg7.install b/debian/jellyfin-ffmpeg7.install
+index 0509a62..4297bdb 100644
+--- a/debian/jellyfin-ffmpeg7.install
++++ b/debian/jellyfin-ffmpeg7.install
+@@ -8,3 +8,4 @@ libavutil/libavutil.so* usr/lib/jellyfin-ffmpeg/lib
+ libpostproc/libpostproc.so* usr/lib/jellyfin-ffmpeg/lib
+ libswresample/libswresample.so* usr/lib/jellyfin-ffmpeg/lib
+ libswscale/libswscale.so* usr/lib/jellyfin-ffmpeg/lib
++debian/tmp/usr/lib/jellyfin-ffmpeg/include
 diff --git a/debian/rules b/debian/rules
-index f8ea6bd..6838980 100755
+index f8ea6bd..17e110e 100755
 --- a/debian/rules
 +++ b/debian/rules
 @@ -27,6 +27,7 @@ CONFIG := --prefix=${TARGET_DIR} \
@@ -10,6 +19,14 @@ index f8ea6bd..6838980 100755
  	--enable-libfreetype \
  	--enable-libfribidi \
  	--enable-libfontconfig \
+@@ -103,6 +104,7 @@ override_dh_auto_clean:
+ 	dh_auto_clean || true
+ 
+ override_dh_auto_install:
++	$(MAKE) install-headers DESTDIR=$(CURDIR)/debian/tmp PREFIX=${TARGET_DIR}
+ 
+ override_dh_usrlocal:
+ 
 diff --git a/docker-build-win64.sh b/docker-build-win64.sh
 index 7e05d66..9a0ea0d 100755
 --- a/docker-build-win64.sh
@@ -49,10 +66,10 @@ index 7e05d66..9a0ea0d 100755
      --enable-libmp3lame \
      --enable-libopus \
 diff --git a/docker-build.sh b/docker-build.sh
-index fc78a5d..f2fea77 100755
+index fc78a5d..0f0903c 100755
 --- a/docker-build.sh
 +++ b/docker-build.sh
-@@ -128,6 +128,27 @@ prepare_extra_common() {
+@@ -128,6 +128,28 @@ prepare_extra_common() {
      popd
      popd
  
@@ -73,6 +90,7 @@ index fc78a5d..f2fea77 100755
 +        ..
 +    make -j$(nproc) && make install && make install DESTDIR=${SOURCE_DIR}/libaribcaption
 +    echo "libaribcaption${TARGET_DIR}/lib/libaribcaption.so* usr/lib/jellyfin-ffmpeg/lib" >> ${DPKG_INSTALL_LIST}
++    echo "libaribcaption${TARGET_DIR}/include/aribcaption usr/lib/jellyfin-ffmpeg/include" >> ${DPKG_INSTALL_LIST}
 +    popd
 +    popd
 +    popd
