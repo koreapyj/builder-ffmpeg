@@ -1,0 +1,157 @@
+name: Build jellyfin-ffmpeg
+
+on:
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - '**/*.md'
+      - 'LICENSE'
+
+  workflow_dispatch:
+    inputs:
+      ffmpeg_ref:
+        description: 'jellyfin-ffmpeg branch or tag to build'
+        required: false
+        default: 'jellyfin'
+        type: string
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: ${{ matrix.distro }}/${{ matrix.codename }} (${{ matrix.arch }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Debian bullseye
+          - distro: debian
+            codename: bullseye
+            arch: amd64
+          - distro: debian
+            codename: bullseye
+            arch: arm64
+          # Debian bookworm
+          - distro: debian
+            codename: bookworm
+            arch: amd64
+          - distro: debian
+            codename: bookworm
+            arch: arm64
+          # Debian trixie
+          - distro: debian
+            codename: trixie
+            arch: amd64
+          - distro: debian
+            codename: trixie
+            arch: arm64
+          # Ubuntu jammy
+          - distro: ubuntu
+            codename: jammy
+            arch: amd64
+          - distro: ubuntu
+            codename: jammy
+            arch: arm64
+          # Ubuntu noble
+          - distro: ubuntu
+            codename: noble
+            arch: amd64
+          - distro: ubuntu
+            codename: noble
+            arch: arm64
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: false
+          swap-storage: true
+
+      - name: Clone jellyfin-ffmpeg
+        run: |
+          git clone --depth 1 --branch "${{ inputs.ffmpeg_ref || 'jellyfin' }}" \
+            https://github.com/jellyfin/jellyfin-ffmpeg.git jellyfin-ffmpeg
+
+      - name: Apply patches
+        run: |
+          if [ -d patches ]; then
+            for patch in patches/*.patch; do
+              [ -f "$patch" ] && git -C jellyfin-ffmpeg apply "../$patch"
+            done
+          fi
+
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y make mmv
+
+      - name: Build
+        working-directory: jellyfin-ffmpeg
+        run: ./build ${{ matrix.codename }} ${{ matrix.arch }} dist
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.distro }}-${{ matrix.codename }}-${{ matrix.arch }}
+          path: jellyfin-ffmpeg/dist/
+          retention-days: 30
+          if-no-files-found: error
+
+  build-windows:
+    name: windows/win64
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: false
+          swap-storage: true
+
+      - name: Clone jellyfin-ffmpeg
+        run: |
+          git clone --depth 1 --branch "${{ inputs.ffmpeg_ref || 'jellyfin' }}" \
+            https://github.com/jellyfin/jellyfin-ffmpeg.git jellyfin-ffmpeg
+
+      - name: Apply patches
+        run: |
+          if [ -d patches ]; then
+            for patch in patches/*.patch; do
+              [ -f "$patch" ] && git -C jellyfin-ffmpeg apply "../$patch"
+            done
+          fi
+
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y make
+
+      - name: Build
+        working-directory: jellyfin-ffmpeg
+        run: ./build-windows-win64 dist
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-win64
+          path: jellyfin-ffmpeg/dist/
+          retention-days: 30
+          if-no-files-found: error
