@@ -1,0 +1,95 @@
+diff --git a/debian/control b/debian/control
+index 9d62637..327e7fa 100644
+--- a/debian/control
++++ b/debian/control
+@@ -15,6 +15,8 @@ Build-Depends:
+  dpkg-dev,
+ # --enable-gnutls
+  libgnutls28-dev | libgnutls-dev,
++# --enable-libaribcaption
++ libaribcaption-dev,
+ # --enable-libbluray
+  libbluray-dev,
+ # --enable-libdrm
+diff --git a/debian/rules b/debian/rules
+index f8ea6bd..6838980 100755
+--- a/debian/rules
++++ b/debian/rules
+@@ -27,6 +27,7 @@ CONFIG := --prefix=${TARGET_DIR} \
+ 	--enable-libdrm \
+ 	--enable-libxml2 \
+ 	--enable-libass \
++	--enable-libaribcaption \
+ 	--enable-libfreetype \
+ 	--enable-libfribidi \
+ 	--enable-libfontconfig \
+diff --git a/docker-build-win64.sh b/docker-build-win64.sh
+index 7e05d66..9a0ea0d 100755
+--- a/docker-build-win64.sh
++++ b/docker-build-win64.sh
+@@ -191,6 +191,25 @@ make install
+ popd
+ popd
+ 
++# LIBARIBCAPTION
++git clone -b v1.1.1 --depth=1 https://github.com/xqq/libaribcaption.git
++pushd libaribcaption
++mkdir build
++pushd build
++cmake \
++    -DCMAKE_TOOLCHAIN_FILE=${FF_CMAKE_TOOLCHAIN} \
++    -DCMAKE_INSTALL_PREFIX=${FF_DEPS_PREFIX} \
++    -DCMAKE_BUILD_TYPE=Release \
++    -DBUILD_SHARED_LIBS=OFF \
++    -DARIBCC_SHARED_LIBRARY=OFF \
++    -DARIBCC_USE_FREETYPE=ON \
++    -DARIBCC_USE_FONTCONFIG=ON \
++    ..
++make -j$(nproc)
++make install
++popd
++popd
++
+ # HARFBUZZ
+ git clone -b 10.4.0 --depth=1 https://github.com/harfbuzz/harfbuzz.git
+ meson setup harfbuzz harfbuzz_build \
+@@ -623,6 +642,7 @@ fi
+     --enable-libfontconfig \
+     --enable-libharfbuzz \
+     --enable-libass \
++    --enable-libaribcaption \
+     --enable-libbluray \
+     --enable-libmp3lame \
+     --enable-libopus \
+diff --git a/docker-build.sh b/docker-build.sh
+index fc78a5d..f2fea77 100755
+--- a/docker-build.sh
++++ b/docker-build.sh
+@@ -128,6 +128,27 @@ prepare_extra_common() {
+     popd
+     popd
+ 
++    # LIBARIBCAPTION
++    pushd ${SOURCE_DIR}
++    git clone -b v1.1.1 --depth=1 https://github.com/xqq/libaribcaption.git
++    pushd libaribcaption
++    mkdir build
++    pushd build
++    cmake \
++        ${CMAKE_TOOLCHAIN_OPT} \
++        -DCMAKE_INSTALL_PREFIX=${TARGET_DIR} \
++        -DCMAKE_BUILD_TYPE=Release \
++        -DBUILD_SHARED_LIBS=ON \
++        -DARIBCC_SHARED_LIBRARY=ON \
++        -DARIBCC_USE_FREETYPE=ON \
++        -DARIBCC_USE_FONTCONFIG=ON \
++        ..
++    make -j$(nproc) && make install && make install DESTDIR=${SOURCE_DIR}/libaribcaption
++    echo "libaribcaption${TARGET_DIR}/lib/libaribcaption.so* usr/lib/jellyfin-ffmpeg/lib" >> ${DPKG_INSTALL_LIST}
++    popd
++    popd
++    popd
++
+     # HARFBUZZ
+     pushd ${SOURCE_DIR}
+     git clone -b 10.4.0 --depth=1 https://github.com/harfbuzz/harfbuzz.git
