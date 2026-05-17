@@ -2,21 +2,11 @@ name: Build jellyfin-ffmpeg
 
 on:
   push:
-    branches:
-      - main
     tags:
       - 'v*'
     paths-ignore:
       - '**/*.md'
       - 'LICENSE'
-
-  workflow_dispatch:
-    inputs:
-      ffmpeg_ref:
-        description: 'jellyfin-ffmpeg branch or tag to build'
-        required: false
-        default: 'jellyfin'
-        type: string
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
@@ -84,7 +74,7 @@ jobs:
 
       - name: Clone jellyfin-ffmpeg
         run: |
-          git clone --depth 1 --branch "${{ inputs.ffmpeg_ref || 'jellyfin' }}" \
+          git clone --depth 1 --branch "${{ github.ref_name }}" \
             https://github.com/jellyfin/jellyfin-ffmpeg.git jellyfin-ffmpeg
 
       - name: Apply patches
@@ -132,7 +122,7 @@ jobs:
 
       - name: Clone jellyfin-ffmpeg
         run: |
-          git clone --depth 1 --branch "${{ inputs.ffmpeg_ref || 'jellyfin' }}" \
+          git clone --depth 1 --branch "${{ github.ref_name }}" \
             https://github.com/jellyfin/jellyfin-ffmpeg.git jellyfin-ffmpeg
 
       - name: Apply patches
