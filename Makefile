@@ -55,7 +55,7 @@ IMAGE_DIGEST = $(shell { cat $(IMAGE_INPUTS) 2>/dev/null; \
                printf '%s\n' '$(CODENAME)' '$(ARCH)' '$(PROFILE)' '$(FF_REF)'; } | sha256sum | cut -d' ' -f1)
 
 .DEFAULT_GOAL := help
-.PHONY: help prepare stage-source-patches image force-image build run package update refresh clean clean-image
+.PHONY: help prepare stage-source-patches image force-image build run package update refresh repatch clean clean-image
 
 help:
 	@echo 'Local patch-authoring / test-build workflow (not used by CI).'
@@ -71,6 +71,8 @@ help:
 	@echo '  package            faithful dpkg-buildpackage -nc -> .deb (parity with CI; needs PROFILE=full)'
 	@echo '  update             copy our quilt-refreshed source patches back to $(SRCPATCHES)/'
 	@echo '  refresh            rebase OUR source patches against current source, then update'
+	@echo '  repatch            re-apply edited $(SRCPATCHES)/ onto the clone (no re-clone),'
+	@echo '                     then "make build" recompiles incrementally'
 	@echo '  clean              remove $(SRC)/ and the image stamp'
 	@echo '  clean-image        remove the builder image'
 	@echo
@@ -196,6 +198,30 @@ update:
 		cp "$$sdir/$$p" "$(SRCPATCHES)/$$p"; \
 	done; \
 	echo "Source patches copied back to $(SRCPATCHES)/ -- review and commit."
+
+# Re-apply edited source-patches/ onto the EXISTING clone after a build, without a
+# re-clone and WITHOUT quilt (the build applies patches via dpkg-source, not quilt).
+# Reverse whatever of our copies are actually applied, restage from source-patches/,
+# then re-apply with plain `git apply` on top of jellyfin's already-applied patches.
+# Only the files our patches touch change, so the next `make build` recompiles
+# incrementally. (Use after editing a source-patches/*.patch by hand; if you edited
+# the tree via quilt instead, `make build` alone is already incremental.)
+repatch:
+	@test -f $(SRC)/debian/patches/series.orig || { echo "Run 'make prepare' first"; exit 1; }
+	@set -e; sdir=$(SRC)/debian/patches; \
+	for p in $$(grep -vxF -f $$sdir/series.orig $$sdir/series 2>/dev/null | tac); do \
+		if [ -f "$$sdir/$$p" ] && git -C $(SRC) apply -R --check "debian/patches/$$p" 2>/dev/null; then \
+			echo "Reverting $$p"; git -C $(SRC) apply -R "debian/patches/$$p"; \
+		fi; \
+	done
+	@$(MAKE) --no-print-directory stage-source-patches
+	@set -e; sdir=$(SRC)/debian/patches; \
+	for p in $$(grep -vxF -f $$sdir/series.orig $$sdir/series 2>/dev/null); do \
+		echo "Applying $$p"; \
+		git -C $(SRC) apply "debian/patches/$$p" || { \
+			echo "  apply failed -- run 'make build' once first so jellyfin's patches are applied"; exit 1; }; \
+	done
+	@echo "Source patches re-applied -- run 'make build' to recompile incrementally."
 
 # Rebase ONLY our source patches against the current source (jellyfin's patches
 # are pushed but never refreshed), then copy them back.
