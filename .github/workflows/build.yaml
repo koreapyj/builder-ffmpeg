@@ -74,16 +74,31 @@ jobs:
 
       - name: Clone jellyfin-ffmpeg
         run: |
-          git clone --depth 1 --branch "${{ github.ref_name }}" \
+          # Local release tags are "<upstream>+<local>" (e.g. v7.1.3-6+1231).
+          # Strip the local "+..." suffix to get the upstream jellyfin tag to build.
+          tag="${{ github.ref_name }}"
+          upstream="${tag%%+*}"
+          echo "Release tag '$tag' -> cloning upstream jellyfin-ffmpeg '$upstream'"
+          git clone --depth 1 --branch "$upstream" \
             https://github.com/jellyfin/jellyfin-ffmpeg.git jellyfin-ffmpeg
 
       - name: Apply patches
         run: |
-          if [ -d patches ]; then
-            for patch in patches/*.patch; do
-              [ -f "$patch" ] && git -C jellyfin-ffmpeg apply "../$patch"
-            done
-          fi
+          set -eu
+          # build/packaging patches -> git-applied to the checkout before the build
+          # runs (docker-build.sh must already carry them when it executes).
+          for patch in patches/*.patch; do
+            [ -e "$patch" ] || continue
+            git -C jellyfin-ffmpeg apply "../$patch"
+          done
+          # ffmpeg-source patches -> appended to jellyfin's debian/patches/series so
+          # both build paths apply them LAST, on top of jellyfin's source patches
+          # (Linux: dpkg-source --before-build; Win64: quilt push over the symlink).
+          for patch in source-patches/*.patch; do
+            [ -e "$patch" ] || continue
+            cp "$patch" jellyfin-ffmpeg/debian/patches/
+            basename "$patch" >> jellyfin-ffmpeg/debian/patches/series
+          done
 
       - name: Install build dependencies
         run: sudo apt-get update && sudo apt-get install -y make mmv
@@ -122,16 +137,31 @@ jobs:
 
       - name: Clone jellyfin-ffmpeg
         run: |
-          git clone --depth 1 --branch "${{ github.ref_name }}" \
+          # Local release tags are "<upstream>+<local>" (e.g. v7.1.3-6+1231).
+          # Strip the local "+..." suffix to get the upstream jellyfin tag to build.
+          tag="${{ github.ref_name }}"
+          upstream="${tag%%+*}"
+          echo "Release tag '$tag' -> cloning upstream jellyfin-ffmpeg '$upstream'"
+          git clone --depth 1 --branch "$upstream" \
             https://github.com/jellyfin/jellyfin-ffmpeg.git jellyfin-ffmpeg
 
       - name: Apply patches
         run: |
-          if [ -d patches ]; then
-            for patch in patches/*.patch; do
-              [ -f "$patch" ] && git -C jellyfin-ffmpeg apply "../$patch"
-            done
-          fi
+          set -eu
+          # build/packaging patches -> git-applied to the checkout before the build
+          # runs (docker-build.sh must already carry them when it executes).
+          for patch in patches/*.patch; do
+            [ -e "$patch" ] || continue
+            git -C jellyfin-ffmpeg apply "../$patch"
+          done
+          # ffmpeg-source patches -> appended to jellyfin's debian/patches/series so
+          # both build paths apply them LAST, on top of jellyfin's source patches
+          # (Linux: dpkg-source --before-build; Win64: quilt push over the symlink).
+          for patch in source-patches/*.patch; do
+            [ -e "$patch" ] || continue
+            cp "$patch" jellyfin-ffmpeg/debian/patches/
+            basename "$patch" >> jellyfin-ffmpeg/debian/patches/series
+          done
 
       - name: Install build dependencies
         run: sudo apt-get update && sudo apt-get install -y make

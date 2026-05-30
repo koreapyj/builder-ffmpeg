@@ -1,0 +1,5 @@
+.claude/**
+
+# Local fast-incremental build workspace (not committed; see Makefile).
+/src/
+/.image-stamp
