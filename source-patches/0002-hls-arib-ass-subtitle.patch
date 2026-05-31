@@ -385,7 +385,7 @@
      char *p = NULL;
      int http_base_proto = ff_is_http_proto(s->url);
      int fmp4_init_filename_len = strlen(hls->fmp4_init_filename) + 1;
-@@ -3022,6 +3162,26 @@ static int hls_init(AVFormatContext *s)
+@@ -3022,6 +3162,40 @@ static int hls_init(AVFormatContext *s)
                  vs->reference_stream_index = vs->streams[j]->index;
              }
              vs->has_subtitle += vs->streams[j]->codecpar->codec_type == AVMEDIA_TYPE_SUBTITLE;
@@ -409,10 +409,24 @@
 +                   "re-based subtitle segments need a wall-clock anchor to align with "
 +                   "the video timeline\n");
 +            return AVERROR(EINVAL);
++        }
++        if (vs->is_arib_ass) {
++            /* The ARIB ASS subtitle shares this output but is written to its own .ass
++             * files and is sparse: ARIB captions go silent for long stretches, and the
++             * tsreadex keep-alive (-c +4) is a caption-management data group that decodes
++             * to NO_CAPTION, so the muxer's subtitle stream produces no packets at all.
++             * The generic DTS interleaver then holds A/V up to max_interleave_delta (10s
++             * default) waiting for that stream, then bursts -- cutting two segments in one
++             * wall-clock second -> duplicate strftime filename -> A/V desync. Cap the bound
++             * well under one segment so a drained burst can never span two boundaries.
++             * Only lowers it; an explicit -max_interleave_delta still wins. */
++            int64_t cap = FFMIN((int64_t)AV_TIME_BASE, hls->time / 2);
++            if (cap > 0 && s->max_interleave_delta > cap)
++                s->max_interleave_delta = cap;
          }
  
          if (vs->has_video > 1)
-@@ -3109,7 +3269,7 @@ static int hls_init(AVFormatContext *s)
+@@ -3109,7 +3283,7 @@ static int hls_init(AVFormatContext *s)
              return ret;
  
          if (vs->has_subtitle) {
@@ -421,7 +435,7 @@
              if (!vs->vtt_oformat)
                  return AVERROR_MUXER_NOT_FOUND;
  
-@@ -3117,18 +3277,51 @@ static int hls_init(AVFormatContext *s)
+@@ -3117,18 +3291,51 @@ static int hls_init(AVFormatContext *s)
              if (p)
                  *p = '\0';
  
@@ -480,7 +494,7 @@
              }
              if (p)
                  *p = '.';
-@@ -3150,6 +3343,8 @@ static int hls_init(AVFormatContext *s)
+@@ -3150,6 +3357,8 @@ static int hls_init(AVFormatContext *s)
  
          if ((ret = hls_start(s, vs)) < 0)
              return ret;
@@ -489,7 +503,7 @@
          vs->number++;
      }
  
-@@ -3176,6 +3371,10 @@ static const AVOption options[] = {
+@@ -3176,6 +3385,10 @@ static const AVOption options[] = {
      {"hls_enc_key_url",    "url to access the key to decrypt the segments", OFFSET(key_url),      AV_OPT_TYPE_STRING, {.str = NULL},            0,       0,         E},
      {"hls_enc_iv",    "hex-coded 16 byte initialization vector", OFFSET(iv),      AV_OPT_TYPE_STRING, .flags = E},
      {"hls_subtitle_path",     "set path of hls subtitles", OFFSET(subtitle_filename), AV_OPT_TYPE_STRING, {.str = NULL},  0, 0,    E},
@@ -500,7 +514,7 @@
      {"hls_segment_type",     "set hls segment files type", OFFSET(segment_type), AV_OPT_TYPE_INT, {.i64 = SEGMENT_TYPE_MPEGTS }, 0, SEGMENT_TYPE_FMP4, E, .unit = "segment_type"},
      {"mpegts",   "make segment file to mpegts files in m3u8", 0, AV_OPT_TYPE_CONST, {.i64 = SEGMENT_TYPE_MPEGTS }, 0, UINT_MAX,   E, .unit = "segment_type"},
      {"fmp4",   "make segment file to fragment mp4 files in m3u8", 0, AV_OPT_TYPE_CONST, {.i64 = SEGMENT_TYPE_FMP4 }, 0, UINT_MAX,   E, .unit = "segment_type"},
-@@ -3197,6 +3396,7 @@ static const AVOption options[] = {
+@@ -3197,6 +3410,7 @@ static const AVOption options[] = {
      {"periodic_rekey", "reload keyinfo file periodically for re-keying", 0, AV_OPT_TYPE_CONST, {.i64 = HLS_PERIODIC_REKEY }, 0, UINT_MAX,   E, .unit = "flags"},
      {"independent_segments", "add EXT-X-INDEPENDENT-SEGMENTS, whenever applicable", 0, AV_OPT_TYPE_CONST, { .i64 = HLS_INDEPENDENT_SEGMENTS }, 0, UINT_MAX, E, .unit = "flags"},
      {"iframes_only", "add EXT-X-I-FRAMES-ONLY, whenever applicable", 0, AV_OPT_TYPE_CONST, { .i64 = HLS_I_FRAMES_ONLY }, 0, UINT_MAX, E, .unit = "flags"},
