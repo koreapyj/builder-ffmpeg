@@ -94,15 +94,17 @@
  } HLSFlags;
  
  typedef enum {
-@@ -134,6 +135,7 @@ typedef struct VariantStream {
+@@ -134,6 +135,9 @@ typedef struct VariantStream {
  
      int has_video;
      int has_subtitle;
 +    int is_arib_ass;          /* subtitle rendition is non-standard ARIB ASS, not webvtt */
++    int is_subtitle_only;     /* ARIB ASS rendition mapped as its OWN variant (own %v dir),
++                                 not bundled in the video variant; its primary muxer is ass */
      int new_start;
      int start_pts_from_audio;
      double dpp;           // duration per packet
-@@ -163,6 +165,9 @@ typedef struct VariantStream {
+@@ -163,6 +167,9 @@ typedef struct VariantStream {
      char *basename;
      char *vtt_basename;
      char *vtt_m3u8_name;
@@ -112,7 +114,7 @@
      char *m3u8_name;
  
      double initial_prog_date_time;
-@@ -197,6 +202,11 @@ typedef struct ClosedCaptionsStream {
+@@ -197,6 +204,11 @@ typedef struct ClosedCaptionsStream {
      const char *language;   /* closed captions language */
  } ClosedCaptionsStream;
  
@@ -124,15 +126,18 @@
  typedef struct HLSContext {
      const AVClass *class;  // Class for private options.
      int64_t start_sequence;
-@@ -211,6 +221,7 @@ typedef struct HLSContext {
+@@ -210,7 +222,10 @@ typedef struct HLSContext {
+     uint32_t pl_type;      // enum PlaylistType
      char *segment_filename;
      char *fmp4_init_filename;
++    char *ass_init_filename; ///< ARIB ASS init-segment filename template (EXT-X-MAP), like fmp4_init_filename
++    int64_t program_origin_pts; ///< first packet pts (AV_TIME_BASE_Q); program presentation origin for subtitle PDT anchoring
      int segment_type;
 +    int subtitle_type;     ///< enum HLSSubtitleType (webvtt default / ass)
      int resend_init_file;  ///< resend init file into disk after refresh m3u8
  
      int use_localtime;      ///< flag to expand filename with localtime
-@@ -222,6 +233,7 @@ typedef struct HLSContext {
+@@ -222,6 +237,7 @@ typedef struct HLSContext {
      char *baseurl;
      char *vtt_format_options_str;
      char *subtitle_filename;
@@ -140,29 +145,72 @@
      AVDictionary *format_options;
  
      int encrypt;
-@@ -875,6 +887,14 @@ static int hls_mux_init(AVFormatContext
-             return ret;
-         vtt_oc          = vs->vtt_avf;
+@@ -552,6 +568,7 @@ static void write_styp(AVIOContext *pb)
+ static int flush_dynbuf(VariantStream *vs, int *range_length)
+ {
+     AVFormatContext *ctx = vs->avf;
++    int ret;
+ 
+     if (!ctx->pb) {
+         return AVERROR(EINVAL);
+@@ -567,7 +584,19 @@ static int flush_dynbuf(VariantStream *v
+     avio_flush(vs->out);
+ 
+     // re-open buffer
+-    return avio_open_dyn_buf(&ctx->pb);
++    ret = avio_open_dyn_buf(&ctx->pb);
++    if (ret < 0)
++        return ret;
++    /* For an independent ARIB ASS rendition the ass muxer is the primary per-segment
++     * muxer. mpegts re-emits PAT/PMT per segment via resend_headers, but the ass muxer
++     * has no such hook and avformat_write_header only ran for the first segment -- so
++     * re-emit the [Events] section header at the top of each subsequent segment buffer
++     * (must match assenc section_header output) or segments 2..N would carry events
++     * with no Format line and be invalid standalone. */
++    if (vs->is_subtitle_only)
++        avio_printf(ctx->pb,
++                    "[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n");
++    return 0;
+ }
+ 
+ static void reflush_dynbuf(VariantStream *vs, int *range_length)
+@@ -877,10 +906,24 @@ static int hls_mux_init(AVFormatContext
          av_dict_copy(&vtt_oc->metadata, s->metadata, 0);
-+        if (vs->is_arib_ass && vtt_oc->priv_data) {
-+            /* ARIB ASS: write open-ended captions with an empty End field, and emit
-+             * every event immediately -- ReadOrder reordering would otherwise drop
-+             * "clear" events after the decoder's flush at a stream discontinuity. */
-+            av_opt_set_int(vtt_oc->priv_data, "infinity_end", 1, 0);
-+            av_opt_set_int(vtt_oc->priv_data, "ignore_readorder", 1, 0);
-+            av_opt_set_int(vtt_oc->priv_data, "section_header", 1, 0);
-+        }
      }
  
++    /* ARIB ASS: write open-ended captions with an empty End field, and emit every
++     * event immediately -- ReadOrder reordering would otherwise drop "clear" events
++     * after the decoder's flush at a stream discontinuity. These go on whichever
++     * context holds the subtitle: the vtt sidecar (bundled with video) or the primary
++     * avf (independent rendition, where the ass muxer IS the primary). */
++    {
++        AVFormatContext *sub_oc = vtt_oc ? vtt_oc : (vs->is_subtitle_only ? oc : NULL);
++        if (vs->is_arib_ass && sub_oc && sub_oc->priv_data) {
++            av_opt_set_int(sub_oc->priv_data, "infinity_end", 1, 0);
++            av_opt_set_int(sub_oc->priv_data, "ignore_readorder", 1, 0);
++            av_opt_set_int(sub_oc->priv_data, "section_header", 1, 0);
++        }
++    }
++
      for (i = 0; i < vs->nb_streams; i++) {
-@@ -912,6 +932,16 @@ static int hls_mux_init(AVFormatContext
+         AVStream *st;
+         AVFormatContext *loc;
+-        if (vs->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_SUBTITLE)
++        if (vs->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_SUBTITLE && vtt_oc)
+             loc = vtt_oc;
+         else
+             loc = oc;
+@@ -912,6 +955,19 @@ static int hls_mux_init(AVFormatContext
              memcpy(sd_dst->data, sd_src->data, sd_src->size);
          }
  
 +        /* ARIB ASS: steal the ASS header so per-segment files carry only Dialogue
-+         * events; the header is written once to ass_init_filename (EXT-X-MAP). */
-+        if (vs->is_arib_ass && loc == vtt_oc && !vs->ass_header &&
-+            st->codecpar->extradata_size > 0) {
++         * events; the header is written once to ass_init_filename (EXT-X-MAP). The
++         * subtitle lives in vtt_oc (bundled) or oc (independent rendition); match on
++         * the stream type so both cases steal from the right copied stream. */
++        if (vs->is_arib_ass &&
++            vs->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_SUBTITLE &&
++            !vs->ass_header && st->codecpar->extradata_size > 0) {
 +            vs->ass_header      = st->codecpar->extradata;
 +            vs->ass_header_size = st->codecpar->extradata_size;
 +            st->codecpar->extradata      = NULL;
@@ -172,7 +220,79 @@
          st->sample_aspect_ratio = vs->streams[i]->sample_aspect_ratio;
          st->time_base = vs->streams[i]->time_base;
          av_dict_copy(&st->metadata, vs->streams[i]->metadata, 0);
-@@ -1543,13 +1573,31 @@ static int create_master_playlist(AVForm
+@@ -953,8 +1009,9 @@ static int hls_mux_init(AVFormatContext
+     if (hls->segment_type == SEGMENT_TYPE_FMP4) {
+         av_dict_set(&options, "fflags", "-autobsf", 0);
+         av_dict_set(&options, "movflags", "+frag_custom+dash+delay_moov", AV_DICT_APPEND);
+-    } else {
+-        /* We only require one PAT/PMT per segment. */
++    } else if (!vs->is_subtitle_only) {
++        /* We only require one PAT/PMT per segment. (mpegts-only; the independent ASS
++         * rendition's primary muxer is the ass muxer, which rejects these options.) */
+         char period[21];
+         snprintf(period, sizeof(period), "%d", (INT_MAX / 2) - 1);
+         av_dict_set(&options, "sdt_period", period, AV_DICT_DONT_OVERWRITE);
+@@ -1159,10 +1216,10 @@ static int hls_append_segment(struct AVF
+     }
+     av_strlcpy(en->filename, filename, sizeof(en->filename));
+ 
+-    if (vs->has_subtitle)
++    if (vs->has_subtitle && vs->vtt_avf)
+         av_strlcpy(en->sub_filename, av_basename(vs->vtt_avf->url), sizeof(en->sub_filename));
+     else
+-        en->sub_filename[0] = '\0';
++        en->sub_filename[0] = '\0';   /* independent ass rendition: segment is en->filename */
+ 
+     en->duration = duration;
+     en->pos      = pos;
+@@ -1471,10 +1528,46 @@ static int create_master_playlist(AVForm
+         ff_hls_write_audio_rendition(hls->m3u8_out, vs->agroup, m3u8_rel_name, vs->language, i, hls->has_default_key ? vs->is_default : 1, nb_channels);
+     }
+ 
++    /* For independent ARIB ASS subtitle variants add #EXT-X-MEDIA:TYPE=SUBTITLES.
++     * Default URI is the variant's own child playlist (its %v directory); with
++     * -arib_master it points at the raw init.ass instead (Shaka workaround). */
++    for (i = 0; i < hls->nb_varstreams; i++) {
++        vs = &(hls->var_streams[i]);
++
++        if (!vs->is_subtitle_only)
++            continue;
++
++        if (vs->is_arib_ass && (hls->flags & HLS_ARIB_MASTER)) {
++            const char *init_rel = get_relative_url(hls->master_m3u8_url, vs->ass_init_filename);
++            if (!init_rel) {
++                av_log(s, AV_LOG_ERROR, "Unable to find relative subtitle init URL\n");
++                goto fail;
++            }
++            avio_printf(hls->m3u8_out,
++                        "#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID=\"%s\",NAME=\"ARIB\",URI=\"%s\"",
++                        vs->sgroup, init_rel);
++            if (vs->language)
++                avio_printf(hls->m3u8_out, ",LANGUAGE=\"%s\"", vs->language);
++            avio_printf(hls->m3u8_out,
++                        ",CHARACTERISTICS=\"public.accessibility.describes-music-and-sound\"\n");
++        } else {
++            m3u8_rel_name = get_relative_url(hls->master_m3u8_url, vs->m3u8_name);
++            if (!m3u8_rel_name) {
++                av_log(s, AV_LOG_ERROR, "Unable to find relative URL\n");
++                goto fail;
++            }
++            ff_hls_write_subtitle_rendition(hls->m3u8_out, vs->sgroup, m3u8_rel_name, vs->language, i, hls->has_default_key ? vs->is_default : 1);
++        }
++    }
++
+     /* For variant streams with video add #EXT-X-STREAM-INF tag with attributes*/
+     for (i = 0; i < hls->nb_varstreams; i++) {
+         vs = &(hls->var_streams[i]);
+ 
++        /* independent subtitle renditions were emitted above as #EXT-X-MEDIA */
++        if (vs->is_subtitle_only)
++            continue;
++
+         m3u8_rel_name = get_relative_url(hls->master_m3u8_url, vs->m3u8_name);
+         if (!m3u8_rel_name) {
+             av_log(s, AV_LOG_ERROR, "Unable to find relative URL\n");
+@@ -1543,13 +1636,35 @@ static int create_master_playlist(AVForm
  
          if (vid_st && vs->sgroup) {
              sgroup = vs->sgroup;
@@ -181,7 +301,11 @@
 -                av_log(s, AV_LOG_WARNING, "Unable to find relative subtitle URL\n");
 -                break;
 -            }
-+            if (vs->is_arib_ass && (hls->flags & HLS_ARIB_MASTER)) {
++            /* Emit the rendition inline ONLY for the bundled case (the subtitle shares
++             * this video variant). For an independent subtitle variant the dedicated
++             * loop above emits it; here we only set sgroup so the STREAM-INF carries
++             * SUBTITLES="<sgroup>". */
++            if (vs->has_subtitle && vs->is_arib_ass && (hls->flags & HLS_ARIB_MASTER)) {
 +                /* aribhls-compatible (non-standard): point the subtitle rendition URI at
 +                 * the raw ASS init segment, not the media playlist -- some players (Shaka)
 +                 * fault on an m3u8 subtitle URI. */
@@ -197,7 +321,7 @@
 +                    avio_printf(hls->m3u8_out, ",LANGUAGE=\"%s\"", vs->language);
 +                avio_printf(hls->m3u8_out,
 +                            ",CHARACTERISTICS=\"public.accessibility.describes-music-and-sound\"\n");
-+            } else {
++            } else if (vs->has_subtitle) {
 +                vtt_m3u8_rel_name = get_relative_url(hls->master_m3u8_url, vs->vtt_m3u8_name);
 +                if (!vtt_m3u8_rel_name) {
 +                    av_log(s, AV_LOG_WARNING, "Unable to find relative subtitle URL\n");
@@ -210,7 +334,52 @@
          }
  
          if (!hls->has_default_key || !hls->has_video_m3u8) {
-@@ -1683,16 +1731,39 @@ static int hls_window(AVFormatContext *s
+@@ -1629,6 +1744,10 @@ static int hls_window(AVFormatContext *s
+         if (target_duration <= en->duration)
+             target_duration = lrint(en->duration);
+     }
++    /* An independent ARIB ASS rendition is written upfront with no segments yet;
++     * give it a valid TARGETDURATION (hls_time) instead of 0, which players reject. */
++    if (!target_duration && vs->is_subtitle_only)
++        target_duration = lrint((double)hls->time / AV_TIME_BASE);
+ 
+     vs->discontinuity_set = 0;
+     ff_hls_write_playlist_header(byterange_mode ? hls->m3u8_out : vs->out, hls->version, hls->allowcache,
+@@ -1638,9 +1757,32 @@ static int hls_window(AVFormatContext *s
+         avio_printf(byterange_mode ? hls->m3u8_out : vs->out, "#EXT-X-DISCONTINUITY\n");
+         vs->discontinuity_set = 1;
+     }
+-    if (vs->has_video && (hls->flags & HLS_INDEPENDENT_SEGMENTS)) {
++    if ((vs->has_video || vs->is_subtitle_only) && (hls->flags & HLS_INDEPENDENT_SEGMENTS)) {
+         avio_printf(byterange_mode ? hls->m3u8_out : vs->out, "#EXT-X-INDEPENDENT-SEGMENTS\n");
+     }
++    if (vs->is_subtitle_only) {
++        /* Independent ARIB ASS rendition playlist: the header lives in init.ass
++         * (EXT-X-MAP), segments carry only events + a PROGRAM-DATE-TIME, and the map
++         * is re-stated after each discontinuity (mirrors aribhls / the bundled
++         * vtt-ass path, but written to this variant's OWN primary playlist). */
++        AVIOContext *po = byterange_mode ? hls->m3u8_out : vs->out;
++        ff_hls_write_init_file(po, av_basename(vs->ass_init_filename), 0, 0, 0);
++        for (en = vs->segments; en; en = en->next) {
++            if (en->discont) {
++                avio_printf(po, "#EXT-X-DISCONTINUITY\n");
++                ff_hls_write_init_file(po, av_basename(vs->ass_init_filename), 0, 0, 0);
++            }
++            ret = ff_hls_write_file_entry(po, 0, byterange_mode,
++                                          en->duration, hls->flags & HLS_ROUND_DURATIONS,
++                                          en->size, en->pos, hls->baseurl, en->filename,
++                                          en->discont_program_date_time ? &en->discont_program_date_time : prog_date_time_p,
++                                          0, 0, 0);
++            if (en->discont_program_date_time)
++                en->discont_program_date_time -= en->duration;
++            if (ret < 0)
++                av_log(s, AV_LOG_WARNING, "ff_hls_write_file_entry get error\n");
++        }
++    } else
+     for (en = vs->segments; en; en = en->next) {
+         if ((hls->encrypt || hls->key_info_file) && (!key_uri || strcmp(en->key_uri, key_uri) ||
+                                     av_strcasecmp(en->iv_string, iv_string))) {
+@@ -1683,16 +1825,39 @@ static int hls_window(AVFormatContext *s
          }
          ff_hls_write_playlist_header(hls->sub_m3u8_out, hls->version, hls->allowcache,
                                       target_duration, sequence, PLAYLIST_TYPE_NONE, 0);
@@ -257,7 +426,7 @@
              ff_hls_write_end_list(hls->sub_m3u8_out);
  
      }
-@@ -1716,6 +1787,35 @@ fail:
+@@ -1716,6 +1881,35 @@ fail:
      return ret;
  }
  
@@ -293,7 +462,7 @@
  static int hls_start(AVFormatContext *s, VariantStream *vs)
  {
      HLSContext *c = s->priv_data;
-@@ -1788,14 +1888,36 @@ static int hls_start(AVFormatContext *s,
+@@ -1788,14 +1982,36 @@ static int hls_start(AVFormatContext *s,
              ff_format_set_url(oc, filename);
          }
          if (vs->vtt_basename) {
@@ -337,20 +506,156 @@
         }
      }
  
-@@ -2501,7 +2623,11 @@ static int hls_write_packet(AVFormatCont
+@@ -1844,7 +2060,7 @@ static int hls_start(AVFormatContext *s,
+         }
+     }
+     if (c->segment_type != SEGMENT_TYPE_FMP4) {
+-        if (oc->oformat->priv_class && oc->priv_data) {
++        if (oc->oformat->priv_class && oc->priv_data && !vs->is_subtitle_only) {
+             av_opt_set(oc->priv_data, "mpegts_flags", "resend_headers", 0);
+         }
+         if (c->flags & HLS_SINGLE_FILE) {
+@@ -2021,6 +2237,52 @@ fail:
+     return ret;
+ }
+ 
++/* Derive vs->ass_init_filename (the ARIB ASS EXT-X-MAP target) following the fmp4 init
++ * convention: a configurable filename (-hls_ass_init_filename, default "init.ass") with
++ * strftime expansion, placed in the directory of `playlist`. Unlike the fmp4 init we do
++ * NOT auto-append the variant index: each ARIB ASS rendition already has its own %v
++ * directory, so its init cannot collide -- a postfix would only add an unstable,
++ * order-dependent suffix. A flat layout that needs disambiguation can put %v in the name. */
++static int set_ass_init_filename(AVFormatContext *s, VariantStream *vs,
++                                 char *playlist, int i)
++{
++    HLSContext *hls = s->priv_data;
++    char *name = NULL, *p;
++    int ret;
++
++    if (av_stristr(hls->ass_init_filename, "%v")) {
++        if ((ret = format_name(hls->ass_init_filename, &name, i, vs->varname)) < 0)
++            return ret;
++    } else {
++        name = av_strdup(hls->ass_init_filename);
++        if (!name)
++            return AVERROR(ENOMEM);
++    }
++
++    if (hls->use_localtime) {
++        char *expanded = NULL;
++        if ((ret = strftime_expand(name, &expanded)) < 0) {
++            av_free(name);
++            return ret;
++        }
++        av_free(name);
++        name = expanded;
++    }
++
++    /* place it in the playlist's directory (EXT-X-MAP URI is the basename) */
++    p = strrchr(playlist, '/');
++    if (p) {
++        char tmp = *(++p);
++        *p = '\0';
++        vs->ass_init_filename = av_asprintf("%s%s", playlist, name);
++        *p = tmp;
++    } else {
++        vs->ass_init_filename = av_strdup(name);
++    }
++    av_free(name);
++    return vs->ass_init_filename ? 0 : AVERROR(ENOMEM);
++}
++
+ static int get_nth_codec_stream_index(AVFormatContext *s,
+                                       enum AVMediaType codec_type,
+                                       int64_t stream_id)
+@@ -2397,6 +2659,19 @@ static int hls_write_header(AVFormatCont
+         }
+     }
+ 
++    /* Write each independent ARIB ASS subtitle rendition's child playlist upfront
++     * (empty, with EXT-X-MAP), like aribhls. The subtitle is sparse and may not
++     * produce a segment for a long time; writing the playlist now makes the rendition
++     * immediately referenceable and -- by setting m3u8_created -- stops
++     * create_master_playlist from blocking the whole master on the first caption. */
++    for (i = 0; i < hls->nb_varstreams; i++) {
++        vs = &hls->var_streams[i];
++        if (vs->is_subtitle_only && !vs->m3u8_created) {
++            if ((ret = hls_window(s, 0, vs)) < 0)
++                return ret;
++        }
++    }
++
+     return 0;
+ }
+ 
+@@ -2471,9 +2746,13 @@ static int hls_write_packet(AVFormatCont
+                 subtitle_streams++;
+             }
+             if (vs->streams[j] == st) {
+-                if (st->codecpar->codec_type == AVMEDIA_TYPE_SUBTITLE) {
++                if (st->codecpar->codec_type == AVMEDIA_TYPE_SUBTITLE && vs->vtt_avf) {
+                     oc = vs->vtt_avf;
+                     stream_index = 0;
++                } else if (st->codecpar->codec_type == AVMEDIA_TYPE_SUBTITLE) {
++                    /* independent ARIB ASS rendition: the ass muxer is the primary */
++                    oc = vs->avf;
++                    stream_index = 0;
+                 } else {
+                     oc = vs->avf;
+                     stream_index = j - subtitle_streams;
+@@ -2491,6 +2770,14 @@ static int hls_write_packet(AVFormatCont
+         return AVERROR(ENOMEM);
+     }
+ 
++    /* Record the program's presentation origin (first packet pts seen) so an
++     * independent, late-starting subtitle rendition can anchor its PROGRAM-DATE-TIME
++     * to the A/V timeline instead of to its own first caption. The interleaver emits
++     * earliest-dts first and A/V begin well before the sparse subtitle, so this is the
++     * A/V origin the player derives from the A/V segment-0 PDT. */
++    if (hls->program_origin_pts == AV_NOPTS_VALUE && pkt->pts != AV_NOPTS_VALUE)
++        hls->program_origin_pts = av_rescale_q(pkt->pts, st->time_base, AV_TIME_BASE_Q);
++
+     end_pts = hls->recording_time * vs->number;
+ 
+     if (vs->sequence - vs->nb_entries > hls->start_sequence && hls->init_time > 0) {
+@@ -2501,10 +2788,26 @@ static int hls_write_packet(AVFormatCont
          end_pts = init_list_dur + after_init_list_dur ;
      }
  
 -    if (vs->start_pts == AV_NOPTS_VALUE) {
-+    /* For the ARIB ASS rendition the subtitle shares the variant with video; don't
-+     * let a sparse, irregularly-timed subtitle packet anchor the A/V segment timeline
-+     * (it would skew video segment cutting). Let video/audio set start_pts. */
++    /* When the ARIB ASS subtitle is BUNDLED with video, don't let a sparse,
++     * irregularly-timed subtitle packet anchor the A/V segment timeline (it would skew
++     * video segment cutting) -- let video/audio set start_pts. For an INDEPENDENT
++     * subtitle-only variant the subtitle is the only stream, so it MUST anchor
++     * start_pts (otherwise the time-based cut never fires). */
 +    if (vs->start_pts == AV_NOPTS_VALUE &&
-+        !(vs->is_arib_ass && st->codecpar->codec_type == AVMEDIA_TYPE_SUBTITLE)) {
++        !(vs->is_arib_ass && st->codecpar->codec_type == AVMEDIA_TYPE_SUBTITLE &&
++          !vs->is_subtitle_only)) {
          vs->start_pts = pkt->pts;
          if (st->codecpar->codec_type == AVMEDIA_TYPE_AUDIO)
              vs->start_pts_from_audio = 1;
-@@ -2717,6 +2843,17 @@ static int hls_write_packet(AVFormatCont
++        /* Independent subtitle rendition: its events are re-based to segment-local
++         * time, but its first caption sits at absolute media S0, not the origin. Shift
++         * this variant's PDT anchor by (S0 - program_origin) so segment-local 0 maps to
++         * the correct wall clock and captions track A/V (else they lead by S0-origin). */
++        if (vs->is_subtitle_only && hls->program_origin_pts != AV_NOPTS_VALUE &&
++            pkt->pts != AV_NOPTS_VALUE) {
++            int64_t s0 = av_rescale_q(pkt->pts, st->time_base, AV_TIME_BASE_Q);
++            vs->initial_prog_date_time += (s0 - hls->program_origin_pts) / (double)AV_TIME_BASE;
++        }
+     }
+     if (vs->start_pts_from_audio && st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO && vs->start_pts > pkt->pts) {
+         vs->start_pts = pkt->pts;
+@@ -2688,7 +2991,7 @@ static int hls_write_packet(AVFormatCont
+             vs->start_pos += vs->size;
+             if (hls->key_info_file || hls->encrypt)
+                 ret = hls_start(s, vs);
+-            if (hls->segment_type == SEGMENT_TYPE_MPEGTS && oc->oformat->priv_class && oc->priv_data) {
++            if (hls->segment_type == SEGMENT_TYPE_MPEGTS && oc->oformat->priv_class && oc->priv_data && !vs->is_subtitle_only) {
+                 av_opt_set(oc->priv_data, "mpegts_flags", "resend_headers", 0);
+             }
+         } else if (hls->max_seg_size > 0) {
+@@ -2717,6 +3020,21 @@ static int hls_write_packet(AVFormatCont
  
      vs->packets_written++;
      if (oc->pb) {
@@ -359,16 +664,20 @@
 +         * pkt->pts is left ABSOLUTE so the shared muxer's dts stays monotonic across
 +         * segments (re-basing pts here caused "non monotonic dts" on live streams). */
 +        if (vs->is_arib_ass && st->codecpar->codec_type == AVMEDIA_TYPE_SUBTITLE &&
-+            vs->has_video && vs->end_pts != AV_NOPTS_VALUE && oc->priv_data) {
-+            int64_t base = av_rescale_q(vs->end_pts,
-+                                        s->streams[vs->reference_stream_index]->time_base,
-+                                        (AVRational){1, 100});
++            vs->end_pts != AV_NOPTS_VALUE && oc->priv_data) {
++            /* Bundled: the segment boundary (vs->end_pts) is in the video reference
++             * stream's time_base. Independent rendition: the subtitle is the only
++             * stream, so end_pts is already in the subtitle stream's own time_base. */
++            AVRational tb = vs->has_video
++                          ? s->streams[vs->reference_stream_index]->time_base
++                          : st->time_base;
++            int64_t base = av_rescale_q(vs->end_pts, tb, (AVRational){1, 100});
 +            av_opt_set_int(oc->priv_data, "rebase_base", base < 0 ? 0 : base, 0);
 +        }
          ret = ff_write_chained(oc, stream_index, pkt, s, 0);
          vs->video_keyframe_size += pkt->size;
          if ((st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) && (pkt->flags & AV_PKT_FLAG_KEY)) {
-@@ -2745,6 +2882,8 @@ static void hls_deinit(AVFormatContext *
+@@ -2745,6 +3063,8 @@ static void hls_deinit(AVFormatContext *
          av_freep(&vs->fmp4_init_filename);
          av_freep(&vs->vtt_basename);
          av_freep(&vs->vtt_m3u8_name);
@@ -377,7 +686,7 @@
  
          avformat_free_context(vs->vtt_avf);
          avformat_free_context(vs->avf);
-@@ -2914,6 +3053,7 @@ static int hls_init(AVFormatContext *s)
+@@ -2914,11 +3234,14 @@ static int hls_init(AVFormatContext *s)
      const char *pattern;
      VariantStream *vs = NULL;
      const char *vtt_pattern = hls->flags & HLS_SINGLE_FILE ? ".vtt" : "%d.vtt";
@@ -385,7 +694,24 @@
      char *p = NULL;
      int http_base_proto = ff_is_http_proto(s->url);
      int fmp4_init_filename_len = strlen(hls->fmp4_init_filename) + 1;
-@@ -3022,6 +3162,40 @@ static int hls_init(AVFormatContext *s)
+     double initial_program_date_time = av_gettime() / 1000000.0;
+ 
++    hls->program_origin_pts = AV_NOPTS_VALUE;
++
+     if (hls->use_localtime) {
+         pattern = get_default_pattern_localtime_fmt(s);
+     } else {
+@@ -2956,6 +3279,9 @@ static int hls_init(AVFormatContext *s)
+             return ret;
+     }
+ 
++    /* No validate_name() for hls_ass_init_filename: it is always placed in the
++     * variant's own (%v) playlist directory, so the name needs no %v to stay unique. */
++
+     if (hls->subtitle_filename) {
+         ret = validate_name(hls->nb_varstreams, hls->subtitle_filename);
+         if (ret < 0)
+@@ -3022,11 +3348,64 @@ static int hls_init(AVFormatContext *s)
                  vs->reference_stream_index = vs->streams[j]->index;
              }
              vs->has_subtitle += vs->streams[j]->codecpar->codec_type == AVMEDIA_TYPE_SUBTITLE;
@@ -423,19 +749,82 @@
 +            int64_t cap = FFMIN((int64_t)AV_TIME_BASE, hls->time / 2);
 +            if (cap > 0 && s->max_interleave_delta > cap)
 +                s->max_interleave_delta = cap;
++        }
++
++        /* ARIB ASS as an INDEPENDENT rendition: when the subtitle is mapped as its
++         * OWN variant (only subtitle stream(s), no video/audio, with an sgroup for the
++         * video STREAM-INF to reference), it becomes a first-class rendition with its
++         * own %v directory, child playlist and .ass segments -- like an audio rendition,
++         * instead of being nested under the video variant's %v. Its primary muxer (avf)
++         * is the ass muxer (set below); no vtt sidecar is used. */
++        if (vs->is_arib_ass && !vs->has_video && vs->has_subtitle == vs->nb_streams) {
++            if (!vs->sgroup) {
++                av_log(s, AV_LOG_ERROR,
++                       "an independent ARIB ASS subtitle variant needs sgroup: in "
++                       "-var_stream_map so the video stream can reference it\n");
++                return AVERROR(EINVAL);
++            }
++            vs->is_subtitle_only = 1;
          }
  
          if (vs->has_video > 1)
-@@ -3109,7 +3283,7 @@ static int hls_init(AVFormatContext *s)
+             av_log(s, AV_LOG_WARNING, "More than a single video stream present, expect issues decoding it.\n");
+-        if (hls->segment_type == SEGMENT_TYPE_FMP4) {
++        if (vs->is_subtitle_only) {
++            /* primary muxer for this variant is the ASS subtitle muxer */
++            vs->oformat = av_guess_format("ass", NULL, NULL);
++        } else if (hls->segment_type == SEGMENT_TYPE_FMP4) {
+             vs->oformat = av_guess_format("mp4", NULL, NULL);
+         } else {
+             vs->oformat = av_guess_format("mpegts", NULL, NULL);
+@@ -3034,7 +3413,27 @@ static int hls_init(AVFormatContext *s)
+         if (!vs->oformat)
+             return AVERROR_MUXER_NOT_FOUND;
+ 
+-        if (hls->segment_filename) {
++        if (vs->is_subtitle_only) {
++            /* .ass segments in this variant's own %v directory: prefer the explicit
++             * -hls_subtitle_segment_filename template (honors %v and strftime), else
++             * derive from this variant's own playlist name. */
++            if (hls->sub_segment_filename) {
++                ret = format_name(hls->sub_segment_filename, &vs->basename, i, vs->varname);
++                if (ret < 0)
++                    return ret;
++            } else {
++                char *q, *base = av_strdup(vs->m3u8_name);
++                if (!base)
++                    return AVERROR(ENOMEM);
++                q = strrchr(base, '.');
++                if (q)
++                    *q = '\0';
++                vs->basename = av_asprintf("%s%s", base, ass_pattern);
++                av_free(base);
++                if (!vs->basename)
++                    return AVERROR(ENOMEM);
++            }
++        } else if (hls->segment_filename) {
+             ret = format_name(hls->segment_filename, &vs->basename, i, vs->varname);
+             if (ret < 0)
+                 return ret;
+@@ -3108,8 +3507,15 @@ static int hls_init(AVFormatContext *s)
+         if (ret < 0)
              return ret;
  
-         if (vs->has_subtitle) {
+-        if (vs->has_subtitle) {
 -            vs->vtt_oformat = av_guess_format("webvtt", NULL, NULL);
++        if (vs->is_subtitle_only) {
++            /* Independent rendition: no vtt sidecar (the ass muxer is the primary, set
++             * above). init.ass (EXT-X-MAP target) is named like the fmp4 init segment
++             * and placed next to this variant's own playlist, in its own %v directory. */
++            if ((ret = set_ass_init_filename(s, vs, vs->m3u8_name, i)) < 0)
++                return ret;
++            vs->vtt_oformat = NULL;
++        } else if (vs->has_subtitle) {
 +            vs->vtt_oformat = av_guess_format(vs->is_arib_ass ? "ass" : "webvtt", NULL, NULL);
              if (!vs->vtt_oformat)
                  return AVERROR_MUXER_NOT_FOUND;
  
-@@ -3117,18 +3291,51 @@ static int hls_init(AVFormatContext *s)
+@@ -3117,18 +3523,49 @@ static int hls_init(AVFormatContext *s)
              if (p)
                  *p = '\0';
  
@@ -450,24 +839,24 @@
 +                    if (p) *p = '.';
                      return ret;
 +                }
-+            } else {
+             } else {
+-                vs->vtt_m3u8_name = av_asprintf("%s_vtt.m3u8", vs->m3u8_name);
+-                if (!vs->vtt_m3u8_name)
 +                vs->vtt_m3u8_name = av_asprintf("%s_%s.m3u8", vs->m3u8_name,
 +                                                vs->is_arib_ass ? "ass" : "vtt");
 +                if (!vs->vtt_m3u8_name) {
 +                    if (p) *p = '.';
-+                    return AVERROR(ENOMEM);
+                     return AVERROR(ENOMEM);
 +                }
 +            }
 +
 +            if (vs->is_arib_ass) {
-+                /* init.ass is co-located with the subtitle playlist (EXT-X-MAP target). */
-+                char *q, *base = av_strdup(vs->vtt_m3u8_name);
-+                if (!base) { if (p) *p = '.'; return AVERROR(ENOMEM); }
-+                q = strrchr(base, '.');
-+                if (q) *q = '\0';
-+                vs->ass_init_filename = av_asprintf("%s_init.ass", base);
-+                av_free(base);
-+                if (!vs->ass_init_filename) { if (p) *p = '.'; return AVERROR(ENOMEM); }
++                /* init.ass (EXT-X-MAP target) is named like the fmp4 init segment and
++                 * co-located with the subtitle playlist. */
++                if ((ret = set_ass_init_filename(s, vs, vs->vtt_m3u8_name, i)) < 0) {
++                    if (p) *p = '.';
++                    return ret;
++                }
 +
 +                if (hls->sub_segment_filename) {
 +                    /* user-specified template (honors %v and, with -strftime, strftime) */
@@ -475,7 +864,7 @@
 +                    if (ret < 0) { if (p) *p = '.'; return ret; }
 +                } else {
 +                    /* default: sequence-numbered segments next to the playlist */
-+                    base = av_strdup(vs->vtt_m3u8_name);
++                    char *q, *base = av_strdup(vs->vtt_m3u8_name);
 +                    if (!base) { if (p) *p = '.'; return AVERROR(ENOMEM); }
 +                    q = strrchr(base, '.');
 +                    if (q) *q = '\0';
@@ -483,18 +872,16 @@
 +                    av_free(base);
 +                    if (!vs->vtt_basename) { if (p) *p = '.'; return AVERROR(ENOMEM); }
 +                }
-             } else {
--                vs->vtt_m3u8_name = av_asprintf("%s_vtt.m3u8", vs->m3u8_name);
--                if (!vs->vtt_m3u8_name)
++            } else {
 +                vs->vtt_basename = av_asprintf("%s%s", vs->m3u8_name, vtt_pattern);
 +                if (!vs->vtt_basename) {
 +                    if (p) *p = '.';
-                     return AVERROR(ENOMEM);
++                    return AVERROR(ENOMEM);
 +                }
              }
              if (p)
                  *p = '.';
-@@ -3150,6 +3357,8 @@ static int hls_init(AVFormatContext *s)
+@@ -3150,6 +3587,8 @@ static int hls_init(AVFormatContext *s)
  
          if ((ret = hls_start(s, vs)) < 0)
              return ret;
@@ -503,18 +890,19 @@
          vs->number++;
      }
  
-@@ -3176,6 +3385,10 @@ static const AVOption options[] = {
+@@ -3176,6 +3615,11 @@ static const AVOption options[] = {
      {"hls_enc_key_url",    "url to access the key to decrypt the segments", OFFSET(key_url),      AV_OPT_TYPE_STRING, {.str = NULL},            0,       0,         E},
      {"hls_enc_iv",    "hex-coded 16 byte initialization vector", OFFSET(iv),      AV_OPT_TYPE_STRING, .flags = E},
      {"hls_subtitle_path",     "set path of hls subtitles", OFFSET(subtitle_filename), AV_OPT_TYPE_STRING, {.str = NULL},  0, 0,    E},
 +    {"hls_subtitle_segment_filename", "filename template for ARIB ASS subtitle segments (supports %v and, with -strftime 1, strftime)", OFFSET(sub_segment_filename), AV_OPT_TYPE_STRING, {.str = NULL}, 0, 0, E},
++    {"hls_ass_init_filename", "set ARIB ASS init segment filename (EXT-X-MAP), like hls_fmp4_init_filename", OFFSET(ass_init_filename), AV_OPT_TYPE_STRING, {.str = "init.ass"}, 0, 0, E},
 +    {"hls_subtitle_type", "set hls subtitle rendition format", OFFSET(subtitle_type), AV_OPT_TYPE_INT, {.i64 = HLS_SUBTITLE_WEBVTT }, 0, HLS_SUBTITLE_ASS, E, .unit = "subtitle_type"},
 +    {"webvtt", "standard WebVTT subtitle segments", 0, AV_OPT_TYPE_CONST, {.i64 = HLS_SUBTITLE_WEBVTT }, 0, UINT_MAX, E, .unit = "subtitle_type"},
 +    {"ass", "non-standard ARIB ASS subtitle segments (init.ass + EXT-X-MAP, re-based, open-ended events); requires -c:s ass", 0, AV_OPT_TYPE_CONST, {.i64 = HLS_SUBTITLE_ASS }, 0, UINT_MAX, E, .unit = "subtitle_type"},
      {"hls_segment_type",     "set hls segment files type", OFFSET(segment_type), AV_OPT_TYPE_INT, {.i64 = SEGMENT_TYPE_MPEGTS }, 0, SEGMENT_TYPE_FMP4, E, .unit = "segment_type"},
      {"mpegts",   "make segment file to mpegts files in m3u8", 0, AV_OPT_TYPE_CONST, {.i64 = SEGMENT_TYPE_MPEGTS }, 0, UINT_MAX,   E, .unit = "segment_type"},
      {"fmp4",   "make segment file to fragment mp4 files in m3u8", 0, AV_OPT_TYPE_CONST, {.i64 = SEGMENT_TYPE_FMP4 }, 0, UINT_MAX,   E, .unit = "segment_type"},
-@@ -3197,6 +3410,7 @@ static const AVOption options[] = {
+@@ -3197,6 +3641,7 @@ static const AVOption options[] = {
      {"periodic_rekey", "reload keyinfo file periodically for re-keying", 0, AV_OPT_TYPE_CONST, {.i64 = HLS_PERIODIC_REKEY }, 0, UINT_MAX,   E, .unit = "flags"},
      {"independent_segments", "add EXT-X-INDEPENDENT-SEGMENTS, whenever applicable", 0, AV_OPT_TYPE_CONST, { .i64 = HLS_INDEPENDENT_SEGMENTS }, 0, UINT_MAX, E, .unit = "flags"},
      {"iframes_only", "add EXT-X-I-FRAMES-ONLY, whenever applicable", 0, AV_OPT_TYPE_CONST, { .i64 = HLS_I_FRAMES_ONLY }, 0, UINT_MAX, E, .unit = "flags"},
