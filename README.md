@@ -82,3 +82,6 @@ upstream (lean simply filters out the HWA-specific `--enable-*`).
 
 `make clean` removes the `./src/` workspace; `make clean-image` removes the
 builder image.
+
+## Credit
+- vf_ivtc_opencl: From [QSVEnc](https://github.com/rigaya/QSVEnc) under MIT License by rigaya.
