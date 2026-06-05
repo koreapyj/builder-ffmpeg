@@ -588,7 +588,270 @@
      return 0;
  }
  
-@@ -2471,9 +2746,13 @@ static int hls_write_packet(AVFormatCont
+@@ -2448,6 +2723,250 @@ static int64_t append_single_file(AVForm
+ 
+     return ret;
+ }
++/* Rotate vs's current segment: close it at presentation time cut_pts (expressed in
++ * cut_tb), append it to the playlist and open the next one. Factored out of
++ * hls_write_packet so the sparse-subtitle keep-up path can rotate an independent ASS
++ * rendition on the A/V clock, not only when one of the rendition's own packets arrives.
++ * Returns 0 on success, <0 on hard error, 1 if the segment write was skipped due to an
++ * ignored I/O error (the caller must not treat that as a normal success). */
++static int hls_rotate_segment(AVFormatContext *s, HLSContext *hls,
++                              VariantStream *vs, int64_t cut_pts, AVRational cut_tb)
++{
++    AVFormatContext *oc = vs->avf;
++    int64_t new_start_pos;
++    int byterange_mode = (hls->flags & HLS_SINGLE_FILE) || (hls->max_seg_size > 0);
++    double cur_duration;
++    int ret = 0, range_length = 0;
++    const char *proto = NULL;
++    int use_temp_file = 0;
++    char *old_filename = NULL;
++
++    av_write_frame(oc, NULL); /* Flush any buffered data */
++    new_start_pos = avio_tell(oc->pb);
++    vs->size = new_start_pos - vs->start_pos;
++    avio_flush(oc->pb);
++    if (hls->segment_type == SEGMENT_TYPE_FMP4) {
++        if (!vs->init_range_length) {
++            range_length = avio_close_dyn_buf(oc->pb, &vs->init_buffer);
++            if (range_length <= 0)
++                return AVERROR(EINVAL);
++            avio_write(vs->out, vs->init_buffer, range_length);
++            if (!hls->resend_init_file)
++                av_freep(&vs->init_buffer);
++            vs->init_range_length = range_length;
++            avio_open_dyn_buf(&oc->pb);
++            vs->packets_written = 0;
++            vs->start_pos = range_length;
++            if (!byterange_mode) {
++                hlsenc_io_close(s, &vs->out, vs->base_output_dirname);
++            }
++        }
++    }
++    if (!byterange_mode) {
++        if (vs->vtt_avf) {
++            hlsenc_io_close(s, &vs->vtt_avf->pb, vs->vtt_avf->url);
++        }
++    }
++
++    if (hls->flags & HLS_SINGLE_FILE) {
++        ret = flush_dynbuf(vs, &range_length);
++        av_freep(&vs->temp_buffer);
++        if (ret < 0) {
++            return ret;
++        }
++        vs->size = range_length;
++        if (hls->key_info_file || hls->encrypt)
++            vs->size = append_single_file(s, vs);
++    } else {
++        if (oc->url[0]) {
++            proto = avio_find_protocol_name(oc->url);
++            use_temp_file = proto && !strcmp(proto, "file")
++                                  && (hls->flags & HLS_TEMP_FILE);
++        }
++
++        if ((hls->max_seg_size > 0 && (vs->size + vs->start_pos >= hls->max_seg_size)) || !byterange_mode) {
++            AVDictionary *options = NULL;
++            char *filename = NULL;
++            if (hls->key_info_file || hls->encrypt) {
++                av_dict_set(&options, "encryption_key", vs->key_string, 0);
++                av_dict_set(&options, "encryption_iv", vs->iv_string, 0);
++                filename = av_asprintf("crypto:%s", oc->url);
++            } else {
++                filename = av_asprintf("%s", oc->url);
++            }
++            if (!filename) {
++                av_dict_free(&options);
++                return AVERROR(ENOMEM);
++            }
++
++            // look to rename the asset name
++            if (use_temp_file)
++                av_dict_set(&options, "mpegts_flags", "resend_headers", 0);
++
++            set_http_options(s, &options, hls);
++
++            ret = hlsenc_io_open(s, &vs->out, filename, &options);
++            if (ret < 0) {
++                av_log(s, hls->ignore_io_errors ? AV_LOG_WARNING : AV_LOG_ERROR,
++                       "Failed to open file '%s'\n", filename);
++                av_freep(&filename);
++                av_dict_free(&options);
++                return hls->ignore_io_errors ? 1 : ret;
++            }
++            if (hls->segment_type == SEGMENT_TYPE_FMP4) {
++                write_styp(vs->out);
++            }
++            ret = flush_dynbuf(vs, &range_length);
++            if (ret < 0) {
++                av_freep(&filename);
++                av_dict_free(&options);
++                return ret;
++            }
++            vs->size = range_length;
++            ret = hlsenc_io_close(s, &vs->out, filename);
++            if (ret < 0) {
++                av_log(s, AV_LOG_WARNING, "upload segment failed,"
++                       " will retry with a new http session.\n");
++                ff_format_io_close(s, &vs->out);
++                ret = hlsenc_io_open(s, &vs->out, filename, &options);
++                if (ret >= 0) {
++                    reflush_dynbuf(vs, &range_length);
++                    ret = hlsenc_io_close(s, &vs->out, filename);
++                }
++            }
++            av_dict_free(&options);
++            av_freep(&vs->temp_buffer);
++            av_freep(&filename);
++        }
++
++        if (use_temp_file)
++            hls_rename_temp_file(s, oc);
++    }
++
++    if (ret < 0)
++        return ret;
++
++    old_filename = av_strdup(oc->url);
++    if (!old_filename) {
++        return AVERROR(ENOMEM);
++    }
++
++    cur_duration = (double)(cut_pts - vs->end_pts) * cut_tb.num / cut_tb.den;
++    ret = hls_append_segment(s, hls, vs, cur_duration, vs->start_pos, vs->size);
++    vs->end_pts = cut_pts;
++    vs->duration = 0;
++    /* Keep time-driven empty subtitle segments genuinely empty; the A/V path never
++     * resets this in the MPEGTS case, so guard it to is_subtitle_only. */
++    if (vs->is_subtitle_only)
++        vs->packets_written = 0;
++    if (ret < 0) {
++        av_freep(&old_filename);
++        return ret;
++    }
++
++    // if we're building a VOD playlist, skip writing the manifest multiple times, and just wait until the end
++    if (hls->pl_type != PLAYLIST_TYPE_VOD) {
++        if ((ret = hls_window(s, 0, vs)) < 0) {
++            av_log(s, AV_LOG_WARNING, "upload playlist failed, will retry with a new http session.\n");
++            ff_format_io_close(s, &vs->out);
++            if ((ret = hls_window(s, 0, vs)) < 0) {
++                av_freep(&old_filename);
++                return ret;
++            }
++        }
++    }
++
++    if (hls->resend_init_file && hls->segment_type == SEGMENT_TYPE_FMP4) {
++        ret = hls_init_file_resend(s, vs);
++        if (ret < 0) {
++            av_freep(&old_filename);
++            return ret;
++        }
++    }
++
++    if (hls->flags & HLS_SINGLE_FILE) {
++        vs->start_pos += vs->size;
++        if (hls->key_info_file || hls->encrypt)
++            ret = hls_start(s, vs);
++        if (hls->segment_type == SEGMENT_TYPE_MPEGTS && oc->oformat->priv_class && oc->priv_data && !vs->is_subtitle_only) {
++            av_opt_set(oc->priv_data, "mpegts_flags", "resend_headers", 0);
++        }
++    } else if (hls->max_seg_size > 0) {
++        if (vs->size + vs->start_pos >= hls->max_seg_size) {
++            vs->sequence++;
++            sls_flag_file_rename(hls, vs, old_filename);
++            ret = hls_start(s, vs);
++            vs->start_pos = 0;
++            /* When split segment by byte, the duration is short than hls_time,
++             * so it is not enough one segment duration as hls_time, */
++        } else {
++            vs->start_pos = new_start_pos;
++        }
++    } else {
++        vs->start_pos = 0;
++        sls_flag_file_rename(hls, vs, old_filename);
++        ret = hls_start(s, vs);
++    }
++    vs->number++;
++    av_freep(&old_filename);
++
++    if (ret < 0) {
++        return ret;
++    }
++    return 0;
++}
++
++/* Sparse-subtitle keep-up: advance any independent ARIB ASS rendition whose current
++ * segment has fallen behind the program clock (clock_pts, in AV_TIME_BASE_Q), emitting
++ * empty .ass segments during caption silence so the playlist keeps moving. */
++static int hls_flush_overdue_subtitles(AVFormatContext *s, HLSContext *hls,
++                                       int64_t clock_pts)
++{
++    int i, ret;
++
++    for (i = 0; i < hls->nb_varstreams; i++) {
++        VariantStream *vs = &hls->var_streams[i];
++        AVRational sub_tb;
++        int64_t clock_sub, seg_len_sub;
++
++        if (!vs->is_subtitle_only || !vs->nb_streams)
++            continue;
++
++        /* vs->start_pts / vs->end_pts are in the subtitle output stream's time_base
++         * (same as the normal cut at the bottom of hls_write_packet); work there. */
++        sub_tb = vs->streams[0]->time_base;
++
++        /* Anchor the rendition to the program origin (the first A/V packet), not to
++         * the first caption: start_pts is otherwise only set when the first dialogue
++         * arrives, so a program that opens with caption silence would emit no subtitle
++         * segments (empty playlist -> stalled player) until then. Anchoring here makes
++         * empty segments flow from the start, aligned with the A/V segment timeline. */
++        if (vs->start_pts == AV_NOPTS_VALUE) {
++            if (hls->program_origin_pts == AV_NOPTS_VALUE)
++                continue;
++            vs->start_pts = av_rescale_q(hls->program_origin_pts, AV_TIME_BASE_Q, sub_tb);
++            vs->end_pts   = vs->start_pts;
++        }
++
++        clock_sub   = av_rescale_q(clock_pts, AV_TIME_BASE_Q, sub_tb);
++        seg_len_sub = av_rescale_q(hls->recording_time, AV_TIME_BASE_Q, sub_tb);
++        if (seg_len_sub <= 0)
++            continue;
++
++        /* Cut exactly at EXTINF boundaries so durations stay uniform; the loop
++         * backfills if the clock jumped past several windows during a long silence. */
++        while (clock_sub >= vs->start_pts + seg_len_sub * vs->number) {
++            int64_t boundary = vs->start_pts + seg_len_sub * vs->number;
++            ret = hls_rotate_segment(s, hls, vs, boundary, sub_tb);
++            if (ret < 0)
++                return ret;
++            if (ret > 0)   /* I/O error ignored; don't spin on the same boundary */
++                break;
++        }
++    }
++    return 0;
++}
++
+ static int hls_write_packet(AVFormatContext *s, AVPacket *pkt)
+ {
+     HLSContext *hls = s->priv_data;
+@@ -2457,11 +2976,7 @@ static int hls_write_packet(AVFormatCont
+     int is_ref_pkt = 1;
+     int ret = 0, can_split = 1, i, j;
+     int stream_index = 0;
+-    int range_length = 0;
+-    const char *proto = NULL;
+-    int use_temp_file = 0;
+     VariantStream *vs = NULL;
+-    char *old_filename = NULL;
+ 
+     for (i = 0; i < hls->nb_varstreams; i++) {
+         int subtitle_streams = 0;
+@@ -2471,9 +2986,13 @@ static int hls_write_packet(AVFormatCont
                  subtitle_streams++;
              }
              if (vs->streams[j] == st) {
@@ -603,7 +866,7 @@
                  } else {
                      oc = vs->avf;
                      stream_index = j - subtitle_streams;
-@@ -2491,6 +2770,14 @@ static int hls_write_packet(AVFormatCont
+@@ -2491,6 +3010,24 @@ static int hls_write_packet(AVFormatCont
          return AVERROR(ENOMEM);
      }
  
@@ -615,10 +878,20 @@
 +    if (hls->program_origin_pts == AV_NOPTS_VALUE && pkt->pts != AV_NOPTS_VALUE)
 +        hls->program_origin_pts = av_rescale_q(pkt->pts, st->time_base, AV_TIME_BASE_Q);
 +
++    /* A/V packets are dense and carry the program clock; use them to rotate any
++     * independent ARIB ASS subtitle rendition whose segment is overdue, so its
++     * playlist keeps advancing through caption silence. The sparse subtitle stream
++     * otherwise produces no packet to trigger a cut, stalling the player. */
++    if (pkt->pts != AV_NOPTS_VALUE && !vs->is_subtitle_only) {
++        int64_t clock_pts = av_rescale_q(pkt->pts, st->time_base, AV_TIME_BASE_Q);
++        if ((ret = hls_flush_overdue_subtitles(s, hls, clock_pts)) < 0)
++            return ret;
++    }
++
      end_pts = hls->recording_time * vs->number;
  
      if (vs->sequence - vs->nb_entries > hls->start_sequence && hls->init_time > 0) {
-@@ -2501,10 +2788,26 @@ static int hls_write_packet(AVFormatCont
+@@ -2501,10 +3038,26 @@ static int hls_write_packet(AVFormatCont
          end_pts = init_list_dur + after_init_list_dur ;
      }
  
@@ -646,16 +919,202 @@
      }
      if (vs->start_pts_from_audio && st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO && vs->start_pts > pkt->pts) {
          vs->start_pts = pkt->pts;
-@@ -2688,7 +2991,7 @@ static int hls_write_packet(AVFormatCont
-             vs->start_pos += vs->size;
-             if (hls->key_info_file || hls->encrypt)
-                 ret = hls_start(s, vs);
+@@ -2526,7 +3079,14 @@ static int hls_write_packet(AVFormatCont
+             vs->new_start = 0;
+             vs->duration = (double)(pkt->pts - vs->end_pts)
+                                        * st->time_base.num / st->time_base.den;
+-            vs->dpp = (double)(pkt->duration) * st->time_base.num / st->time_base.den;
++            /* An independent ARIB ASS rendition's reference packet is the sparse,
++             * open-ended subtitle whose pkt->duration is UINT32_MAX; letting it into
++             * vs->duration/dpp poisons EXTINF and EXT-X-TARGETDURATION. Derive segment
++             * length from PTS boundaries (cur_duration) instead and keep dpp at 0. */
++            vs->dpp = vs->is_subtitle_only ? 0 :
++                      (double)(pkt->duration) * st->time_base.num / st->time_base.den;
++        } else if (vs->is_subtitle_only) {
++            vs->duration = (double)(pkt->pts - vs->end_pts) * st->time_base.num / st->time_base.den;
+         } else {
+             if (pkt->duration) {
+                 vs->duration += (double)(pkt->duration) * st->time_base.num / st->time_base.den;
+@@ -2541,182 +3101,30 @@ static int hls_write_packet(AVFormatCont
+     can_split = can_split && (pkt->pts - vs->end_pts > 0);
+     if (vs->packets_written && can_split && av_compare_ts(pkt->pts - vs->start_pts, st->time_base,
+                                                           end_pts, AV_TIME_BASE_Q) >= 0) {
+-        int64_t new_start_pos;
+-        int byterange_mode = (hls->flags & HLS_SINGLE_FILE) || (hls->max_seg_size > 0);
+-        double cur_duration;
+-
+-        av_write_frame(oc, NULL); /* Flush any buffered data */
+-        new_start_pos = avio_tell(oc->pb);
+-        vs->size = new_start_pos - vs->start_pos;
+-        avio_flush(oc->pb);
+-        if (hls->segment_type == SEGMENT_TYPE_FMP4) {
+-            if (!vs->init_range_length) {
+-                range_length = avio_close_dyn_buf(oc->pb, &vs->init_buffer);
+-                if (range_length <= 0)
+-                    return AVERROR(EINVAL);
+-                avio_write(vs->out, vs->init_buffer, range_length);
+-                if (!hls->resend_init_file)
+-                    av_freep(&vs->init_buffer);
+-                vs->init_range_length = range_length;
+-                avio_open_dyn_buf(&oc->pb);
+-                vs->packets_written = 0;
+-                vs->start_pos = range_length;
+-                if (!byterange_mode) {
+-                    hlsenc_io_close(s, &vs->out, vs->base_output_dirname);
+-                }
+-            }
+-        }
+-        if (!byterange_mode) {
+-            if (vs->vtt_avf) {
+-                hlsenc_io_close(s, &vs->vtt_avf->pb, vs->vtt_avf->url);
+-            }
+-        }
+-
+-        if (hls->flags & HLS_SINGLE_FILE) {
+-            ret = flush_dynbuf(vs, &range_length);
+-            av_freep(&vs->temp_buffer);
+-            if (ret < 0) {
+-                return ret;
+-            }
+-            vs->size = range_length;
+-            if (hls->key_info_file || hls->encrypt)
+-                vs->size = append_single_file(s, vs);
+-        } else {
+-            if (oc->url[0]) {
+-                proto = avio_find_protocol_name(oc->url);
+-                use_temp_file = proto && !strcmp(proto, "file")
+-                                      && (hls->flags & HLS_TEMP_FILE);
+-            }
+-
+-            if ((hls->max_seg_size > 0 && (vs->size + vs->start_pos >= hls->max_seg_size)) || !byterange_mode) {
+-                AVDictionary *options = NULL;
+-                char *filename = NULL;
+-                if (hls->key_info_file || hls->encrypt) {
+-                    av_dict_set(&options, "encryption_key", vs->key_string, 0);
+-                    av_dict_set(&options, "encryption_iv", vs->iv_string, 0);
+-                    filename = av_asprintf("crypto:%s", oc->url);
+-                } else {
+-                    filename = av_asprintf("%s", oc->url);
+-                }
+-                if (!filename) {
+-                    av_dict_free(&options);
+-                    return AVERROR(ENOMEM);
+-                }
+-
+-                // look to rename the asset name
+-                if (use_temp_file)
+-                    av_dict_set(&options, "mpegts_flags", "resend_headers", 0);
+-
+-                set_http_options(s, &options, hls);
+-
+-                ret = hlsenc_io_open(s, &vs->out, filename, &options);
+-                if (ret < 0) {
+-                    av_log(s, hls->ignore_io_errors ? AV_LOG_WARNING : AV_LOG_ERROR,
+-                           "Failed to open file '%s'\n", filename);
+-                    av_freep(&filename);
+-                    av_dict_free(&options);
+-                    return hls->ignore_io_errors ? 0 : ret;
+-                }
+-                if (hls->segment_type == SEGMENT_TYPE_FMP4) {
+-                    write_styp(vs->out);
+-                }
+-                ret = flush_dynbuf(vs, &range_length);
+-                if (ret < 0) {
+-                    av_freep(&filename);
+-                    av_dict_free(&options);
+-                    return ret;
+-                }
+-                vs->size = range_length;
+-                ret = hlsenc_io_close(s, &vs->out, filename);
+-                if (ret < 0) {
+-                    av_log(s, AV_LOG_WARNING, "upload segment failed,"
+-                           " will retry with a new http session.\n");
+-                    ff_format_io_close(s, &vs->out);
+-                    ret = hlsenc_io_open(s, &vs->out, filename, &options);
+-                    if (ret >= 0) {
+-                        reflush_dynbuf(vs, &range_length);
+-                        ret = hlsenc_io_close(s, &vs->out, filename);
+-                    }
+-                }
+-                av_dict_free(&options);
+-                av_freep(&vs->temp_buffer);
+-                av_freep(&filename);
+-            }
+-
+-            if (use_temp_file)
+-                hls_rename_temp_file(s, oc);
+-        }
+-
++        ret = hls_rotate_segment(s, hls, vs, pkt->pts, st->time_base);
+         if (ret < 0)
+             return ret;
+-
+-        old_filename = av_strdup(oc->url);
+-        if (!old_filename) {
+-            return AVERROR(ENOMEM);
+-        }
+-
+-        cur_duration = (double)(pkt->pts - vs->end_pts) * st->time_base.num / st->time_base.den;
+-        ret = hls_append_segment(s, hls, vs, cur_duration, vs->start_pos, vs->size);
+-        vs->end_pts = pkt->pts;
+-        vs->duration = 0;
+-        if (ret < 0) {
+-            av_freep(&old_filename);
+-            return ret;
+-        }
+-
+-        // if we're building a VOD playlist, skip writing the manifest multiple times, and just wait until the end
+-        if (hls->pl_type != PLAYLIST_TYPE_VOD) {
+-            if ((ret = hls_window(s, 0, vs)) < 0) {
+-                av_log(s, AV_LOG_WARNING, "upload playlist failed, will retry with a new http session.\n");
+-                ff_format_io_close(s, &vs->out);
+-                if ((ret = hls_window(s, 0, vs)) < 0) {
+-                    av_freep(&old_filename);
+-                    return ret;
+-                }
+-            }
+-        }
+-
+-        if (hls->resend_init_file && hls->segment_type == SEGMENT_TYPE_FMP4) {
+-            ret = hls_init_file_resend(s, vs);
+-            if (ret < 0) {
+-                av_freep(&old_filename);
+-                return ret;
+-            }
+-        }
+-
+-        if (hls->flags & HLS_SINGLE_FILE) {
+-            vs->start_pos += vs->size;
+-            if (hls->key_info_file || hls->encrypt)
+-                ret = hls_start(s, vs);
 -            if (hls->segment_type == SEGMENT_TYPE_MPEGTS && oc->oformat->priv_class && oc->priv_data) {
-+            if (hls->segment_type == SEGMENT_TYPE_MPEGTS && oc->oformat->priv_class && oc->priv_data && !vs->is_subtitle_only) {
-                 av_opt_set(oc->priv_data, "mpegts_flags", "resend_headers", 0);
-             }
-         } else if (hls->max_seg_size > 0) {
-@@ -2717,6 +3020,21 @@ static int hls_write_packet(AVFormatCont
+-                av_opt_set(oc->priv_data, "mpegts_flags", "resend_headers", 0);
+-            }
+-        } else if (hls->max_seg_size > 0) {
+-            if (vs->size + vs->start_pos >= hls->max_seg_size) {
+-                vs->sequence++;
+-                sls_flag_file_rename(hls, vs, old_filename);
+-                ret = hls_start(s, vs);
+-                vs->start_pos = 0;
+-                /* When split segment by byte, the duration is short than hls_time,
+-                 * so it is not enough one segment duration as hls_time, */
+-            } else {
+-                vs->start_pos = new_start_pos;
+-            }
+-        } else {
+-            vs->start_pos = 0;
+-            sls_flag_file_rename(hls, vs, old_filename);
+-            ret = hls_start(s, vs);
+-        }
+-        vs->number++;
+-        av_freep(&old_filename);
+-
+-        if (ret < 0) {
+-            return ret;
+-        }
++        if (ret > 0)  /* I/O error ignored (ignore_io_errors): behave as before */
++            return 0;
+     }
  
      vs->packets_written++;
      if (oc->pb) {
@@ -677,7 +1136,7 @@
          ret = ff_write_chained(oc, stream_index, pkt, s, 0);
          vs->video_keyframe_size += pkt->size;
          if ((st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) && (pkt->flags & AV_PKT_FLAG_KEY)) {
-@@ -2745,6 +3063,8 @@ static void hls_deinit(AVFormatContext *
+@@ -2745,6 +3153,8 @@ static void hls_deinit(AVFormatContext *
          av_freep(&vs->fmp4_init_filename);
          av_freep(&vs->vtt_basename);
          av_freep(&vs->vtt_m3u8_name);
@@ -686,7 +1145,7 @@
  
          avformat_free_context(vs->vtt_avf);
          avformat_free_context(vs->avf);
-@@ -2914,11 +3234,14 @@ static int hls_init(AVFormatContext *s)
+@@ -2914,11 +3324,14 @@ static int hls_init(AVFormatContext *s)
      const char *pattern;
      VariantStream *vs = NULL;
      const char *vtt_pattern = hls->flags & HLS_SINGLE_FILE ? ".vtt" : "%d.vtt";
@@ -701,7 +1160,7 @@
      if (hls->use_localtime) {
          pattern = get_default_pattern_localtime_fmt(s);
      } else {
-@@ -2956,6 +3279,9 @@ static int hls_init(AVFormatContext *s)
+@@ -2956,6 +3369,9 @@ static int hls_init(AVFormatContext *s)
              return ret;
      }
  
@@ -711,7 +1170,7 @@
      if (hls->subtitle_filename) {
          ret = validate_name(hls->nb_varstreams, hls->subtitle_filename);
          if (ret < 0)
-@@ -3022,11 +3348,64 @@ static int hls_init(AVFormatContext *s)
+@@ -3022,11 +3438,64 @@ static int hls_init(AVFormatContext *s)
                  vs->reference_stream_index = vs->streams[j]->index;
              }
              vs->has_subtitle += vs->streams[j]->codecpar->codec_type == AVMEDIA_TYPE_SUBTITLE;
@@ -777,7 +1236,7 @@
              vs->oformat = av_guess_format("mp4", NULL, NULL);
          } else {
              vs->oformat = av_guess_format("mpegts", NULL, NULL);
-@@ -3034,7 +3413,27 @@ static int hls_init(AVFormatContext *s)
+@@ -3034,7 +3503,27 @@ static int hls_init(AVFormatContext *s)
          if (!vs->oformat)
              return AVERROR_MUXER_NOT_FOUND;
  
@@ -806,7 +1265,7 @@
              ret = format_name(hls->segment_filename, &vs->basename, i, vs->varname);
              if (ret < 0)
                  return ret;
-@@ -3108,8 +3507,15 @@ static int hls_init(AVFormatContext *s)
+@@ -3108,8 +3597,15 @@ static int hls_init(AVFormatContext *s)
          if (ret < 0)
              return ret;
  
@@ -824,7 +1283,7 @@
              if (!vs->vtt_oformat)
                  return AVERROR_MUXER_NOT_FOUND;
  
-@@ -3117,18 +3523,49 @@ static int hls_init(AVFormatContext *s)
+@@ -3117,18 +3613,49 @@ static int hls_init(AVFormatContext *s)
              if (p)
                  *p = '\0';
  
@@ -881,7 +1340,7 @@
              }
              if (p)
                  *p = '.';
-@@ -3150,6 +3587,8 @@ static int hls_init(AVFormatContext *s)
+@@ -3150,6 +3677,8 @@ static int hls_init(AVFormatContext *s)
  
          if ((ret = hls_start(s, vs)) < 0)
              return ret;
@@ -890,7 +1349,7 @@
          vs->number++;
      }
  
-@@ -3176,6 +3615,11 @@ static const AVOption options[] = {
+@@ -3176,6 +3705,11 @@ static const AVOption options[] = {
      {"hls_enc_key_url",    "url to access the key to decrypt the segments", OFFSET(key_url),      AV_OPT_TYPE_STRING, {.str = NULL},            0,       0,         E},
      {"hls_enc_iv",    "hex-coded 16 byte initialization vector", OFFSET(iv),      AV_OPT_TYPE_STRING, .flags = E},
      {"hls_subtitle_path",     "set path of hls subtitles", OFFSET(subtitle_filename), AV_OPT_TYPE_STRING, {.str = NULL},  0, 0,    E},
@@ -902,7 +1361,7 @@
      {"hls_segment_type",     "set hls segment files type", OFFSET(segment_type), AV_OPT_TYPE_INT, {.i64 = SEGMENT_TYPE_MPEGTS }, 0, SEGMENT_TYPE_FMP4, E, .unit = "segment_type"},
      {"mpegts",   "make segment file to mpegts files in m3u8", 0, AV_OPT_TYPE_CONST, {.i64 = SEGMENT_TYPE_MPEGTS }, 0, UINT_MAX,   E, .unit = "segment_type"},
      {"fmp4",   "make segment file to fragment mp4 files in m3u8", 0, AV_OPT_TYPE_CONST, {.i64 = SEGMENT_TYPE_FMP4 }, 0, UINT_MAX,   E, .unit = "segment_type"},
-@@ -3197,6 +3641,7 @@ static const AVOption options[] = {
+@@ -3197,6 +3731,7 @@ static const AVOption options[] = {
      {"periodic_rekey", "reload keyinfo file periodically for re-keying", 0, AV_OPT_TYPE_CONST, {.i64 = HLS_PERIODIC_REKEY }, 0, UINT_MAX,   E, .unit = "flags"},
      {"independent_segments", "add EXT-X-INDEPENDENT-SEGMENTS, whenever applicable", 0, AV_OPT_TYPE_CONST, { .i64 = HLS_INDEPENDENT_SEGMENTS }, 0, UINT_MAX, E, .unit = "flags"},
      {"iframes_only", "add EXT-X-I-FRAMES-ONLY, whenever applicable", 0, AV_OPT_TYPE_CONST, { .i64 = HLS_I_FRAMES_ONLY }, 0, UINT_MAX, E, .unit = "flags"},
