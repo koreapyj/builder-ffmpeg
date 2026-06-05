@@ -1,0 +1,21 @@
+hlsenc: emit HEVC codec string as ".B0" instead of ".B01"
+
+The HLS muxer writes the RFC 6381 codec parameter for hvc1 with a hardcoded
+trailing constraint-flags byte ".B01". Some browser / MSE codec-string parsers
+reject that trailing nibble and refuse to play the variant, even though the
+constraint flags do not affect decoding. Emit ".B0" instead, which those players
+accept and which decodes identically.
+--- a/libavformat/hlsenc.c
++++ b/libavformat/hlsenc.c
+@@ -433,7 +433,10 @@ static void write_codec_attr(AVStream *s
+         if (st->codecpar->codec_tag == MKTAG('h','v','c','1') &&
+             profile != AV_PROFILE_UNKNOWN &&
+             level != AV_LEVEL_UNKNOWN) {
+-            snprintf(attr, sizeof(attr), "%s.%d.4.L%d.B01", av_fourcc2str(st->codecpar->codec_tag), profile, level);
++            /* Emit the HEVC constraint-flags byte as ".B0" (not ".B01"): some
++             * browsers/MSE parsers reject the trailing nibble and refuse the
++             * stream, while ".B0" is accepted and the media decodes identically. */
++            snprintf(attr, sizeof(attr), "%s.%d.4.L%d.B0", av_fourcc2str(st->codecpar->codec_tag), profile, level);
+         } else
+             goto fail;
+     } else if (st->codecpar->codec_id == AV_CODEC_ID_MP2) {
