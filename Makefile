@@ -9,7 +9,7 @@
 SHELL := /bin/bash
 
 FF_REPO  ?= https://github.com/jellyfin/jellyfin-ffmpeg.git
-FF_REF   ?= v7.1.3-6
+FF_REF   ?= v7.1.4-3
 
 # Default target = same as host (both overridable). Codename falls back to
 # bookworm if the host distro isn't one upstream's `build` script supports.

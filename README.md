@@ -1,15 +1,5 @@
 # builder-ffmpeg
 
-Patch overlay for [jellyfin/jellyfin-ffmpeg](https://github.com/jellyfin/jellyfin-ffmpeg),
-built into `.deb` / win64 artifacts by
-[`.github/workflows/build.yaml`](.github/workflows/build.yaml) (the CI source of truth —
-release builds are triggered by pushing a `v*` tag).
-
-**Release tags:** push the upstream jellyfin tag directly (e.g. `v7.1.3-6`), or append a local
-revision with `+` (e.g. `v7.1.3-6+1231`) to cut multiple local releases off the same upstream
-version. CI clones the upstream part (before `+`) and names the GitHub release after the full
-tag. (`~` can't be used — git forbids it in tag names; `+` is valid.)
-
 ## Two kinds of patches
 
 Our patches always layer **on top of** jellyfin's, never under:
@@ -77,7 +67,7 @@ upstream (lean simply filters out the HWA-specific `--enable-*`).
 
 ### Useful variables
 
-`FF_REF` (upstream tag, default `v7.1.3-6`), `FF_REPO`, `CODENAME` / `ARCH`
+`FF_REF` (upstream tag, default `v7.1.4-3`), `FF_REPO`, `CODENAME` / `ARCH`
 (default: same as host), `PROFILE`. Run `make help` for the full list.
 
 `make clean` removes the `./src/` workspace; `make clean-image` removes the
