@@ -2,6 +2,8 @@ name: Build jellyfin-ffmpeg
 
 on:
   push:
+    branches:
+      - '**'
     tags:
       - 'v*'
     paths-ignore:
@@ -11,6 +13,9 @@ on:
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
   cancel-in-progress: true
+
+env:
+  FF_REF: v7.1.4-3
 
 jobs:
   build:
@@ -74,12 +79,8 @@ jobs:
 
       - name: Clone jellyfin-ffmpeg
         run: |
-          # Local release tags are "<upstream>+<local>" (e.g. v7.1.3-6+1231).
-          # Strip the local "+..." suffix to get the upstream jellyfin tag to build.
-          tag="${{ github.ref_name }}"
-          upstream="${tag%%+*}"
-          echo "Release tag '$tag' -> cloning upstream jellyfin-ffmpeg '$upstream'"
-          git clone --depth 1 --branch "$upstream" \
+          echo "Cloning upstream jellyfin-ffmpeg '$FF_REF'"
+          git clone --depth 1 --branch "$FF_REF" \
             https://github.com/jellyfin/jellyfin-ffmpeg.git jellyfin-ffmpeg
 
       - name: Apply patches
@@ -137,12 +138,8 @@ jobs:
 
       - name: Clone jellyfin-ffmpeg
         run: |
-          # Local release tags are "<upstream>+<local>" (e.g. v7.1.3-6+1231).
-          # Strip the local "+..." suffix to get the upstream jellyfin tag to build.
-          tag="${{ github.ref_name }}"
-          upstream="${tag%%+*}"
-          echo "Release tag '$tag' -> cloning upstream jellyfin-ffmpeg '$upstream'"
-          git clone --depth 1 --branch "$upstream" \
+          echo "Cloning upstream jellyfin-ffmpeg '$FF_REF'"
+          git clone --depth 1 --branch "$FF_REF" \
             https://github.com/jellyfin/jellyfin-ffmpeg.git jellyfin-ffmpeg
 
       - name: Apply patches
