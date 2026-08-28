@@ -1,0 +1,133 @@
+fftools: unwrap periodic MPEG-TS timestamp wraparound per stream
+
+Long-lived MPEG-TS ingest reaches the 33-bit PTS/DTS wrap roughly every 26.5
+hours. ts_discontinuity_detect() detects the resulting backward jump per
+stream, but corrects it through the shared ts_offset_discont. As streams cross
+the wrap at different packet-arrival times, the shared offset oscillates by one
+wrap period and permanently desynchronizes audio and video.
+
+Unwrap periodic wraps independently for every stream before the shared
+discontinuity machinery runs. This preserves per-stream continuity without
+changing genuine-discontinuity handling, covers data and subtitle streams
+through a PTS fallback, and applies accumulated offsets exactly in the
+timestamp tick domain.
+
+With -copyts, wrapping MPEG-TS inputs now produce monotonically continuing
+timestamps instead of wrapped values, which is the desired behavior for
+continuous ingest.
+
+--- a/fftools/ffmpeg_demux.c
++++ b/fftools/ffmpeg_demux.c
+@@ -80,6 +80,10 @@ typedef struct DemuxStream {
+     int64_t                  next_dts;
+     ///< dts of the last packet read for this stream (in AV_TIME_BASE units)
+     int64_t                  dts;
++    ///< last pre-unwrap reference timestamp (dts, or pts fallback) in AV_TIME_BASE units
++    int64_t                  last_raw_dts;
++    ///< number of pts_wrap_bits timestamp wraps this stream has crossed
++    int                      wrap_count;
+ 
+     const AVCodecDescriptor *codec_desc;
+ 
+@@ -274,12 +278,93 @@ static void ts_discontinuity_detect(Demu
+     d->last_ts = av_rescale_q(pkt->dts, pkt->time_base, AV_TIME_BASE_Q);
+ }
+ 
++/*
++ * Per-stream unwrapping of periodic timestamp wraparound (e.g. the 33-bit
++ * PTS/DTS wrap in MPEG-TS, every ~26.5h).
++ *
++ * ts_discontinuity_detect() below detects jumps per stream, but corrects them
++ * through the shared d->ts_offset_discont applied to ALL streams. When a
++ * wrapping input runs across the wrap point, each stream crosses it at a
++ * different packet, so the shared offset is corrected back and forth by one
++ * wrap period on every packet, permanently desynchronizing the streams.
++ * Unwrap the wrap here, per stream, before that machinery runs: timestamps
++ * then continue monotonically, per-stream continuity holds and the
++ * discontinuity handling only ever sees genuine discontinuities.
++ * Note this intentionally changes -copyts behavior for wrapping inputs:
++ * timestamps continue past the wrap instead of wrapping.
++ */
++static void ts_wrap_unwrap(Demuxer *d, InputStream *ist, AVPacket *pkt)
++{
++    DemuxStream *ds = ds_from_ist(ist);
++    int64_t ref, wrap_ticks, wrap_period_us, raw;
++
++    if (!(d->f.ctx->iformat->flags & AVFMT_TS_DISCONT) ||
++        ist->st->pts_wrap_bits >= 60)
++        return;
++
++    ref = pkt->dts != AV_NOPTS_VALUE ? pkt->dts : pkt->pts;
++    if (ref == AV_NOPTS_VALUE)
++        return;
++
++    wrap_ticks = 1LL << ist->st->pts_wrap_bits;
++    wrap_period_us = av_rescale_q(wrap_ticks, pkt->time_base, AV_TIME_BASE_Q);
++    raw = av_rescale_q_rnd(ref, pkt->time_base, AV_TIME_BASE_Q,
++                           AV_ROUND_NEAR_INF | AV_ROUND_PASS_MINMAX);
++
++    if (ds->last_raw_dts != AV_NOPTS_VALUE) {
++        int64_t delta_raw = raw - ds->last_raw_dts;
++
++        /*
++         * The tolerance (wrap_period/4, ~6.6h for TS) requires the backward
++         * jump to be within a quarter period of the full wrap period.
++         * Generous enough for sparse data/caption streams whose PES packets
++         * may be minutes apart around the crossing, while ordinary
++         * resets/backward jumps stay far outside the window and fall through
++         * to the existing discontinuity handling unchanged. A genuine reset
++         * landing exactly at ~one wrap period back is indistinguishable from
++         * a wrap; unwrapping is the safer interpretation for continuous
++         * broadcast input.
++         */
++        if (delta_raw < 0 &&
++            FFABS(delta_raw + wrap_period_us) < wrap_period_us / 4) {
++            ds->wrap_count++;
++            av_log(ist, AV_LOG_INFO,
++                   "stream %d: %d-bit timestamp wrap crossed (count=%d), unwrapping\n",
++                   ist->st->id, ist->st->pts_wrap_bits, ds->wrap_count);
++        }
++    }
++
++    ds->last_raw_dts = raw;
++
++    if (ds->wrap_count) {
++        int64_t offset = ds->wrap_count * wrap_ticks;
++
++        if (pkt->dts != AV_NOPTS_VALUE)
++            pkt->dts += offset;
++        if (pkt->pts != AV_NOPTS_VALUE)
++            pkt->pts += offset;
++        // Reordered frames straddling the wrap can have pts on the other
++        // side of the boundary than dts; bring pts back within half a
++        // period of dts.
++        if (pkt->pts != AV_NOPTS_VALUE && pkt->dts != AV_NOPTS_VALUE) {
++            if (pkt->pts - pkt->dts > wrap_ticks / 2)
++                pkt->pts -= wrap_ticks;
++            else if (pkt->dts - pkt->pts > wrap_ticks / 2)
++                pkt->pts += wrap_ticks;
++        }
++    }
++}
++
+ static void ts_discontinuity_process(Demuxer *d, InputStream *ist,
+                                      AVPacket *pkt)
+ {
+     int64_t offset = av_rescale_q(d->ts_offset_discont, AV_TIME_BASE_Q,
+                                   pkt->time_base);
+ 
++    // unwrap periodic timestamp wraparound per stream, for all stream types,
++    // before the shared-offset discontinuity handling below
++    ts_wrap_unwrap(d, ist, pkt);
++
+     // apply previously-detected timestamp-discontinuity offset
+     // (to all streams, not just audio/video)
+     if (pkt->dts != AV_NOPTS_VALUE)
+@@ -1240,6 +1325,7 @@ static DemuxStream *demux_stream_alloc(D
+ 
+     ds->sch_idx_stream = -1;
+     ds->sch_idx_dec    = -1;
++    ds->last_raw_dts   = AV_NOPTS_VALUE;
+ 
+     ds->ist.st         = st;
+     ds->ist.file       = f;
