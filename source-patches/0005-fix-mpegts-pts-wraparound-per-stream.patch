@@ -18,7 +18,7 @@ continuous ingest.
 
 --- a/fftools/ffmpeg_demux.c
 +++ b/fftools/ffmpeg_demux.c
-@@ -80,6 +80,10 @@ typedef struct DemuxStream {
+@@ -80,6 +80,15 @@ typedef struct DemuxStream {
      int64_t                  next_dts;
      ///< dts of the last packet read for this stream (in AV_TIME_BASE units)
      int64_t                  dts;
@@ -26,10 +26,15 @@ continuous ingest.
 +    int64_t                  last_raw_dts;
 +    ///< number of pts_wrap_bits timestamp wraps this stream has crossed
 +    int                      wrap_count;
++    // cached wrap constants and the inputs they were computed from
++    int64_t                  wrap_ticks;
++    int64_t                  wrap_period_us;
++    AVRational               wrap_tb;
++    int                      wrap_bits;
  
      const AVCodecDescriptor *codec_desc;
  
-@@ -274,12 +278,93 @@ static void ts_discontinuity_detect(Demu
+@@ -274,12 +283,102 @@ static void ts_discontinuity_detect(Demu
      d->last_ts = av_rescale_q(pkt->dts, pkt->time_base, AV_TIME_BASE_Q);
  }
  
@@ -61,8 +66,17 @@ continuous ingest.
 +    if (ref == AV_NOPTS_VALUE)
 +        return;
 +
-+    wrap_ticks = 1LL << ist->st->pts_wrap_bits;
-+    wrap_period_us = av_rescale_q(wrap_ticks, pkt->time_base, AV_TIME_BASE_Q);
++    if (!ds->wrap_ticks || ds->wrap_bits != ist->st->pts_wrap_bits ||
++        ds->wrap_tb.num != pkt->time_base.num ||
++        ds->wrap_tb.den != pkt->time_base.den) {
++        ds->wrap_bits      = ist->st->pts_wrap_bits;
++        ds->wrap_tb        = pkt->time_base;
++        ds->wrap_ticks     = 1LL << ds->wrap_bits;
++        ds->wrap_period_us = av_rescale_q(ds->wrap_ticks, ds->wrap_tb,
++                                          AV_TIME_BASE_Q);
++    }
++    wrap_ticks     = ds->wrap_ticks;
++    wrap_period_us = ds->wrap_period_us;
 +    raw = av_rescale_q_rnd(ref, pkt->time_base, AV_TIME_BASE_Q,
 +                           AV_ROUND_NEAR_INF | AV_ROUND_PASS_MINMAX);
 +
@@ -123,7 +137,7 @@ continuous ingest.
      // apply previously-detected timestamp-discontinuity offset
      // (to all streams, not just audio/video)
      if (pkt->dts != AV_NOPTS_VALUE)
-@@ -1240,6 +1325,7 @@ static DemuxStream *demux_stream_alloc(D
+@@ -1240,6 +1339,7 @@ static DemuxStream *demux_stream_alloc(D
  
      ds->sch_idx_stream = -1;
      ds->sch_idx_dec    = -1;

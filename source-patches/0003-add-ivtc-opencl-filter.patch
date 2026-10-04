@@ -70,7 +70,7 @@ libavfilter/opencl_source.h.
 
 --- /dev/null
 +++ b/libavfilter/vf_ivtc_opencl.c
-@@ -0,0 +1,815 @@
+@@ -0,0 +1,926 @@
 +/*
 + * Copyright (c) 2026
 + *
@@ -134,6 +134,7 @@ libavfilter/opencl_source.h.
 +
 +#define IVTC_WG 16
 +#define IVTC_CYCLE 5
++#define IVTC_INFLIGHT_MAX 12   // refs held between blocking reads (3 per synth)
 +#define IVTC_NCAND 5          // field-match candidates: C, P, N, B, U
 +
 +typedef struct IvtcOpenCLContext {
@@ -148,7 +149,9 @@ libavfilter/opencl_source.h.
 +    cl_kernel kernel_compare;     // fm_compare_accum: compare_fields accumulators
 +    int initialised;
 +
-+    cl_mem    diff_buf;           // per-WG luma SAD partials (nwg float)
++    cl_mem    diff_buf;           // per-WG luma SAD partials (IVTC_CYCLE slices of diff_stride floats)
++    cl_mem    diff_sub[IVTC_CYCLE]; // sub-buffer per slice of diff_buf
++    int       diff_stride;        // floats between slices (aligned to MEM_BASE_ADDR_ALIGN)
 +    cl_mem    absdiff_buf;        // |cur-cand| per borrowed field row (w*hf uchar)
 +    cl_mem    flag_buf;           // build_diff_map flags (w*hf uchar)
 +    cl_mem    cmp_buf;            // per-WG compare_fields partials (nwg*6 float)
@@ -156,6 +159,12 @@ libavfilter/opencl_source.h.
 +    float    *cmp_host;
 +    int       nwg, nwgx, nwgy;    // work-group grid over the luma plane
 +    int       luma_w, luma_h, luma_hf;  // luma_hf = luma_h/2 (borrowed field rows)
++    int       nb_planes;          // cached output plane count / dimensions
++    size_t    plane_w[AV_NUM_DATA_POINTERS], plane_h[AV_NUM_DATA_POINTERS];
++
++    // frames still referenced by enqueued, not yet synchronised GPU work
++    AVFrame  *inflight[IVTC_INFLIGHT_MAX];
++    int       n_inflight;
 +
 +    // options
 +    int     tff_opt;              // -1 auto, 0 BFF, 1 TFF
@@ -199,12 +208,31 @@ libavfilter/opencl_source.h.
 +
 +// ---- small helpers -------------------------------------------------------
 +
-+static int ivtc_image_dims(cl_mem img, size_t *w, size_t *h)
++// Drop the frame refs held for in-flight GPU work. Only call right after a
++// blocking read / clFinish on the (in-order) command queue.
++static void ivtc_release_inflight(IvtcOpenCLContext *ctx)
 +{
-+    cl_int cle;
-+    cle  = clGetImageInfo(img, CL_IMAGE_WIDTH,  sizeof(*w), w, NULL);
-+    cle |= clGetImageInfo(img, CL_IMAGE_HEIGHT, sizeof(*h), h, NULL);
-+    return cle == CL_SUCCESS ? 0 : AVERROR(EIO);
++    while (ctx->n_inflight > 0)
++        av_frame_free(&ctx->inflight[--ctx->n_inflight]);
++}
++
++// Full sync + release (explicit paths: error, flush, uninit).
++static void ivtc_sync_release(IvtcOpenCLContext *ctx)
++{
++    if (ctx->command_queue)
++        clFinish(ctx->command_queue);
++    ivtc_release_inflight(ctx);
++}
++
++static int ivtc_set_arg(AVFilterContext *avctx, cl_kernel k, int idx,
++                        size_t sz, const void *val)
++{
++    cl_int cle = clSetKernelArg(k, idx, sz, val);
++    if (cle != CL_SUCCESS) {
++        av_log(avctx, AV_LOG_ERROR, "set kernel arg %d failed: %d.\n", idx, cle);
++        return AVERROR(EIO);
++    }
++    return 0;
 +}
 +
 +static int ivtc_resolve_tff(IvtcOpenCLContext *ctx, const AVFrame *f)
@@ -250,9 +278,26 @@ libavfilter/opencl_source.h.
 +    ctx->nwgy = (ctx->luma_h + IVTC_WG - 1) / IVTC_WG;
 +    ctx->nwg  = ctx->nwgx * ctx->nwgy;
 +
-+    ctx->diff_buf = clCreateBuffer(ctx->ocf.hwctx->context, CL_MEM_WRITE_ONLY,
-+                                   ctx->nwg * sizeof(cl_float), NULL, &cle);
-+    if (!ctx->diff_buf) { av_log(avctx, AV_LOG_ERROR, "diff_buf: %d.\n", cle); return AVERROR(EIO); }
++    {
++        cl_uint align_bits = 0;
++        size_t align, stride_bytes;
++        cle = clGetDeviceInfo(ctx->ocf.hwctx->device_id, CL_DEVICE_MEM_BASE_ADDR_ALIGN,
++                              sizeof(align_bits), &align_bits, NULL);
++        align = (cle == CL_SUCCESS && align_bits >= 8) ? align_bits / 8 : 1024;
++        if (align < sizeof(cl_float))
++            align = sizeof(cl_float);
++        stride_bytes = FFALIGN((size_t)ctx->nwg * sizeof(cl_float), align);
++        ctx->diff_stride = stride_bytes / sizeof(cl_float);
++        ctx->diff_buf = clCreateBuffer(ctx->ocf.hwctx->context, CL_MEM_READ_WRITE,
++                                       stride_bytes * IVTC_CYCLE, NULL, &cle);
++        if (!ctx->diff_buf) { av_log(avctx, AV_LOG_ERROR, "diff_buf: %d.\n", cle); return AVERROR(EIO); }
++        for (int i = 0; i < IVTC_CYCLE; i++) {
++            cl_buffer_region reg = { stride_bytes * i, (size_t)ctx->nwg * sizeof(cl_float) };
++            ctx->diff_sub[i] = clCreateSubBuffer(ctx->diff_buf, CL_MEM_READ_WRITE,
++                                                 CL_BUFFER_CREATE_TYPE_REGION, &reg, &cle);
++            if (!ctx->diff_sub[i]) { av_log(avctx, AV_LOG_ERROR, "diff sub-buffer %d: %d.\n", i, cle); return AVERROR(EIO); }
++        }
++    }
 +    ctx->absdiff_buf = clCreateBuffer(ctx->ocf.hwctx->context, CL_MEM_READ_WRITE,
 +                                      (size_t)ctx->luma_w * ctx->luma_hf, NULL, &cle);
 +    if (!ctx->absdiff_buf) { av_log(avctx, AV_LOG_ERROR, "absdiff_buf: %d.\n", cle); return AVERROR(EIO); }
@@ -263,30 +308,42 @@ libavfilter/opencl_source.h.
 +                                  ctx->nwg * 6 * sizeof(cl_float), NULL, &cle);
 +    if (!ctx->cmp_buf) { av_log(avctx, AV_LOG_ERROR, "cmp_buf: %d.\n", cle); return AVERROR(EIO); }
 +
-+    ctx->diff_host = av_malloc_array(ctx->nwg, sizeof(float));
++    ctx->diff_host = av_calloc((size_t)ctx->diff_stride * IVTC_CYCLE, sizeof(float));
 +    ctx->cmp_host  = av_malloc_array(ctx->nwg, 6 * sizeof(float));
 +    if (!ctx->diff_host || !ctx->cmp_host)
 +        return AVERROR(ENOMEM);
++
++    // Constant kernel args (indices match the signatures in opencl/ivtc.cl).
++    {
++        cl_int w = ctx->luma_w, h = ctx->luma_h, hf = ctx->luma_hf;
++        int e = 0;
++        // fm_absdiff(cur, cand, width, hf, tff, D)
++        e |= ivtc_set_arg(avctx, ctx->kernel_absdiff, 2, sizeof(w), &w);
++        e |= ivtc_set_arg(avctx, ctx->kernel_absdiff, 3, sizeof(hf), &hf);
++        e |= ivtc_set_arg(avctx, ctx->kernel_absdiff, 5, sizeof(cl_mem), &ctx->absdiff_buf);
++        // fm_diffmap(D, width, hf, F)
++        e |= ivtc_set_arg(avctx, ctx->kernel_diffmap, 0, sizeof(cl_mem), &ctx->absdiff_buf);
++        e |= ivtc_set_arg(avctx, ctx->kernel_diffmap, 1, sizeof(w), &w);
++        e |= ivtc_set_arg(avctx, ctx->kernel_diffmap, 2, sizeof(hf), &hf);
++        e |= ivtc_set_arg(avctx, ctx->kernel_diffmap, 3, sizeof(cl_mem), &ctx->flag_buf);
++        // fm_compare_accum(cur, cand, width, height, tff, F, hf, out)
++        e |= ivtc_set_arg(avctx, ctx->kernel_compare, 2, sizeof(w), &w);
++        e |= ivtc_set_arg(avctx, ctx->kernel_compare, 3, sizeof(h), &h);
++        e |= ivtc_set_arg(avctx, ctx->kernel_compare, 5, sizeof(cl_mem), &ctx->flag_buf);
++        e |= ivtc_set_arg(avctx, ctx->kernel_compare, 6, sizeof(hf), &hf);
++        e |= ivtc_set_arg(avctx, ctx->kernel_compare, 7, sizeof(cl_mem), &ctx->cmp_buf);
++        // ivtc_diff(a, b, width, height, diffs)
++        e |= ivtc_set_arg(avctx, ctx->kernel_diff, 2, sizeof(w), &w);
++        e |= ivtc_set_arg(avctx, ctx->kernel_diff, 3, sizeof(h), &h);
++        if (e)
++            return AVERROR(EIO);
++    }
 +
 +    ctx->initialised = 1;
 +    return 0;
 +}
 +
 +// ---- kernel launches ------------------------------------------------------
-+
-+static int ivtc_set_args(AVFilterContext *avctx, cl_kernel k, int n,
-+                         const OpenCLKernelArg *args)
-+{
-+    cl_int cle;
-+    for (int i = 0; i < n; i++) {
-+        cle = clSetKernelArg(k, i, args[i].arg_size, args[i].arg_val);
-+        if (cle != CL_SUCCESS) {
-+            av_log(avctx, AV_LOG_ERROR, "set kernel arg %d failed: %d.\n", i, cle);
-+            return AVERROR(EIO);
-+        }
-+    }
-+    return 0;
-+}
 +
 +// compare_fields decision (vf_fieldmatch.c:586-608). a = match1 accumulators
 +// {c,m,ml}, b = match2. Returns 1 if match2 wins, 0 if match1.
@@ -323,45 +380,37 @@ libavfilter/opencl_source.h.
 +                           cl_mem next, int tff, int *out_match)
 +{
 +    IvtcOpenCLContext *ctx = avctx->priv;
-+    cl_int cle, w = ctx->luma_w, h = ctx->luma_h, hf = ctx->luma_hf, ctff = tff;
++    cl_int cle, ctff = tff;
 +    size_t gf[2]  = { (size_t)ctx->luma_w, (size_t)ctx->luma_hf };
 +    size_t gw[2]  = { (size_t)ctx->nwgx * IVTC_WG, (size_t)ctx->nwgy * IVTC_WG };
 +    size_t loc[2] = { IVTC_WG, IVTC_WG };
 +    double A[3] = { 0, 0, 0 }, B[3] = { 0, 0, 0 };
 +    int err, i, m;
 +
-+    const OpenCLKernelArg ad[] = {
-+        { sizeof(cl_mem), &cur }, { sizeof(cl_mem), &prev },
-+        { sizeof(cl_int), &w }, { sizeof(cl_int), &hf }, { sizeof(cl_int), &ctff },
-+        { sizeof(cl_mem), &ctx->absdiff_buf },
-+    };
-+    const OpenCLKernelArg dm[] = {
-+        { sizeof(cl_mem), &ctx->absdiff_buf }, { sizeof(cl_int), &w },
-+        { sizeof(cl_int), &hf }, { sizeof(cl_mem), &ctx->flag_buf },
-+    };
-+    const OpenCLKernelArg cm[] = {
-+        { sizeof(cl_mem), &cur }, { sizeof(cl_mem), &prev },
-+        { sizeof(cl_int), &w }, { sizeof(cl_int), &h }, { sizeof(cl_int), &ctff },
-+        { sizeof(cl_mem), &ctx->flag_buf }, { sizeof(cl_int), &hf },
-+        { sizeof(cl_mem), &ctx->cmp_buf },
-+    };
 +    (void)next;
 +
-+    if ((err = ivtc_set_args(avctx, ctx->kernel_absdiff, FF_ARRAY_ELEMS(ad), ad)) < 0) return err;
++    if ((err = ivtc_set_arg(avctx, ctx->kernel_absdiff, 0, sizeof(cl_mem), &cur)) < 0 ||
++        (err = ivtc_set_arg(avctx, ctx->kernel_absdiff, 1, sizeof(cl_mem), &prev)) < 0 ||
++        (err = ivtc_set_arg(avctx, ctx->kernel_absdiff, 4, sizeof(cl_int), &ctff)) < 0)
++        return err;
 +    cle = clEnqueueNDRangeKernel(ctx->command_queue, ctx->kernel_absdiff, 2, NULL, gf, NULL, 0, NULL, NULL);
 +    if (cle != CL_SUCCESS) { av_log(avctx, AV_LOG_ERROR, "absdiff enqueue: %d.\n", cle); return AVERROR(EIO); }
 +
-+    if ((err = ivtc_set_args(avctx, ctx->kernel_diffmap, FF_ARRAY_ELEMS(dm), dm)) < 0) return err;
 +    cle = clEnqueueNDRangeKernel(ctx->command_queue, ctx->kernel_diffmap, 2, NULL, gf, NULL, 0, NULL, NULL);
 +    if (cle != CL_SUCCESS) { av_log(avctx, AV_LOG_ERROR, "diffmap enqueue: %d.\n", cle); return AVERROR(EIO); }
 +
-+    if ((err = ivtc_set_args(avctx, ctx->kernel_compare, FF_ARRAY_ELEMS(cm), cm)) < 0) return err;
++    if ((err = ivtc_set_arg(avctx, ctx->kernel_compare, 0, sizeof(cl_mem), &cur)) < 0 ||
++        (err = ivtc_set_arg(avctx, ctx->kernel_compare, 1, sizeof(cl_mem), &prev)) < 0 ||
++        (err = ivtc_set_arg(avctx, ctx->kernel_compare, 4, sizeof(cl_int), &ctff)) < 0)
++        return err;
 +    cle = clEnqueueNDRangeKernel(ctx->command_queue, ctx->kernel_compare, 2, NULL, gw, loc, 0, NULL, NULL);
 +    if (cle != CL_SUCCESS) { av_log(avctx, AV_LOG_ERROR, "compare enqueue: %d.\n", cle); return AVERROR(EIO); }
 +
 +    cle = clEnqueueReadBuffer(ctx->command_queue, ctx->cmp_buf, CL_TRUE, 0,
 +                              ctx->nwg * 6 * sizeof(cl_float), ctx->cmp_host, 0, NULL, NULL);
 +    if (cle != CL_SUCCESS) { av_log(avctx, AV_LOG_ERROR, "cmp readback: %d.\n", cle); return AVERROR(EIO); }
++    // blocking read on the in-order queue: all earlier work (incl. prior synths) is done
++    ivtc_release_inflight(ctx);
 +
 +    for (i = 0; i < ctx->nwg; i++) {
 +        A[0] += ctx->cmp_host[i*6+0]; A[1] += ctx->cmp_host[i*6+1]; A[2] += ctx->cmp_host[i*6+2];
@@ -382,25 +431,43 @@ libavfilter/opencl_source.h.
 +    cl_int cle, ctff = tff, cmatch = match;
 +    int err, p;
 +
-+    for (p = 0; p < AV_NUM_DATA_POINTERS && dst->data[p]; p++) {
++    // make room: if a caller ever queues more synths than fit, sync first
++    if (ctx->n_inflight + 3 > IVTC_INFLIGHT_MAX)
++        ivtc_sync_release(ctx);
++
++    if ((err = ivtc_set_arg(avctx, ctx->kernel_synth, 4, sizeof(cl_int), &ctff)) < 0 ||
++        (err = ivtc_set_arg(avctx, ctx->kernel_synth, 5, sizeof(cl_int), &cmatch)) < 0)
++        return err;
++
++    for (p = 0; p < ctx->nb_planes && dst->data[p]; p++) {
 +        cl_mem d = (cl_mem)dst->data[p];
 +        cl_mem pp = (cl_mem)prev->data[p], cc = (cl_mem)cur->data[p], nn = (cl_mem)next->data[p];
-+        size_t w, h, global[2];
-+        const OpenCLKernelArg args[] = {
-+            { sizeof(cl_mem), &d }, { sizeof(cl_mem), &pp }, { sizeof(cl_mem), &cc },
-+            { sizeof(cl_mem), &nn }, { sizeof(cl_int), &ctff }, { sizeof(cl_int), &cmatch },
-+        };
-+        if ((err = ivtc_image_dims(d, &w, &h)) < 0)
++        size_t global[2] = { ctx->plane_w[p], ctx->plane_h[p] };
++        if ((err = ivtc_set_arg(avctx, ctx->kernel_synth, 0, sizeof(cl_mem), &d)) < 0 ||
++            (err = ivtc_set_arg(avctx, ctx->kernel_synth, 1, sizeof(cl_mem), &pp)) < 0 ||
++            (err = ivtc_set_arg(avctx, ctx->kernel_synth, 2, sizeof(cl_mem), &cc)) < 0 ||
++            (err = ivtc_set_arg(avctx, ctx->kernel_synth, 3, sizeof(cl_mem), &nn)) < 0)
 +            return err;
-+        if ((err = ivtc_set_args(avctx, ctx->kernel_synth, FF_ARRAY_ELEMS(args), args)) < 0)
-+            return err;
-+        global[0] = w; global[1] = h;
 +        cle = clEnqueueNDRangeKernel(ctx->command_queue, ctx->kernel_synth, 2, NULL,
 +                                     global, NULL, 0, NULL, NULL);
 +        if (cle != CL_SUCCESS) { av_log(avctx, AV_LOG_ERROR, "synth enqueue plane %d: %d.\n", p, cle); return AVERROR(EIO); }
 +    }
-+    cle = clFinish(ctx->command_queue);
-+    return cle == CL_SUCCESS ? 0 : AVERROR(EIO);
++
++    // No clFinish: hold refs on the input frames until the next blocking read so
++    // their buffers cannot return to the upstream pool while the GPU still reads them.
++    ctx->inflight[ctx->n_inflight] = av_frame_clone(prev);
++    if (!ctx->inflight[ctx->n_inflight])
++        return AVERROR(ENOMEM);
++    ctx->n_inflight++;
++    ctx->inflight[ctx->n_inflight] = av_frame_clone(cur);
++    if (!ctx->inflight[ctx->n_inflight])
++        return AVERROR(ENOMEM);
++    ctx->n_inflight++;
++    ctx->inflight[ctx->n_inflight] = av_frame_clone(next);
++    if (!ctx->inflight[ctx->n_inflight])
++        return AVERROR(ENOMEM);
++    ctx->n_inflight++;
++    return 0;
 +}
 +
 +// Per-block luma diff between two matched frames, reduced to vf_decimate's two
@@ -412,46 +479,45 @@ libavfilter/opencl_source.h.
 +// Ranking duplicates by maxbdiff -- not the global sum -- is what makes limited-
 +// animation frames (small moving region, low global sum, high local diff) lose
 +// to the true woven duplicate (low diff everywhere), matching vf_decimate.
-+static int ivtc_block_diffs(AVFilterContext *avctx, AVFrame *a, AVFrame *b,
-+                            double *maxbdiff, double *totdiff)
++static int ivtc_diff_enqueue(AVFilterContext *avctx, AVFrame *a, AVFrame *b, int slice)
 +{
 +    IvtcOpenCLContext *ctx = avctx->priv;
 +    cl_int cle;
-+    cl_int w = ctx->luma_w, h = ctx->luma_h;
 +    cl_mem ma = (cl_mem)a->data[0], mb = (cl_mem)b->data[0];
 +    size_t global[2] = { (size_t)ctx->nwgx * IVTC_WG, (size_t)ctx->nwgy * IVTC_WG };
 +    size_t local[2]  = { IVTC_WG, IVTC_WG };
-+    const OpenCLKernelArg args[] = {
-+        { sizeof(cl_mem), &ma }, { sizeof(cl_mem), &mb },
-+        { sizeof(cl_int), &w },  { sizeof(cl_int), &h }, { sizeof(cl_mem), &ctx->diff_buf },
-+    };
-+    int err = ivtc_set_args(avctx, ctx->kernel_diff, FF_ARRAY_ELEMS(args), args);
-+    int i, j;
-+    double tot = 0.0, mx = -1.0;
-+    if (err < 0)
++    int err;
++    if ((err = ivtc_set_arg(avctx, ctx->kernel_diff, 0, sizeof(cl_mem), &ma)) < 0 ||
++        (err = ivtc_set_arg(avctx, ctx->kernel_diff, 1, sizeof(cl_mem), &mb)) < 0 ||
++        (err = ivtc_set_arg(avctx, ctx->kernel_diff, 4, sizeof(cl_mem), &ctx->diff_sub[slice])) < 0)
 +        return err;
 +    cle = clEnqueueNDRangeKernel(ctx->command_queue, ctx->kernel_diff, 2, NULL,
 +                                 global, local, 0, NULL, NULL);
 +    if (cle != CL_SUCCESS) { av_log(avctx, AV_LOG_ERROR, "diff enqueue: %d.\n", cle); return AVERROR(EIO); }
-+    cle = clEnqueueReadBuffer(ctx->command_queue, ctx->diff_buf, CL_TRUE, 0,
-+                              ctx->nwg * sizeof(cl_float), ctx->diff_host, 0, NULL, NULL);
-+    if (cle != CL_SUCCESS) { av_log(avctx, AV_LOG_ERROR, "diff readback: %d.\n", cle); return AVERROR(EIO); }
++    return 0;
++}
++
++static void ivtc_diff_metrics(IvtcOpenCLContext *ctx, int slice,
++                              double *maxbdiff, double *totdiff)
++{
++    const float *dh = ctx->diff_host + (size_t)slice * ctx->diff_stride;
++    int i, j;
++    double tot = 0.0, mx = -1.0;
 +
 +    for (i = 0; i < ctx->nwg; i++)
-+        tot += ctx->diff_host[i];
++        tot += dh[i];
 +    for (i = 0; i < ctx->nwgy - 1; i++) {
 +        for (j = 0; j < ctx->nwgx - 1; j++) {
-+            double t = (double)ctx->diff_host[ i      * ctx->nwgx + j    ]
-+                     + (double)ctx->diff_host[ i      * ctx->nwgx + j + 1]
-+                     + (double)ctx->diff_host[(i + 1) * ctx->nwgx + j    ]
-+                     + (double)ctx->diff_host[(i + 1) * ctx->nwgx + j + 1];
++            double t = (double)dh[ i      * ctx->nwgx + j    ]
++                     + (double)dh[ i      * ctx->nwgx + j + 1]
++                     + (double)dh[(i + 1) * ctx->nwgx + j    ]
++                     + (double)dh[(i + 1) * ctx->nwgx + j + 1];
 +            if (t > mx)
 +                mx = t;
 +        }
 +    }
 +    *totdiff  = tot;
 +    *maxbdiff = mx < 0.0 ? tot : mx;   // grids smaller than 2x2 fall back to total
-+    return 0;
 +}
 +
 +// ---- emit + decimation ----------------------------------------------------
@@ -504,13 +570,25 @@ libavfilter/opencl_source.h.
 +
 +    // metric of each frame vs its temporal predecessor; cyc[0]'s predecessor is
 +    // the previous cycle's last frame (dec_prev), exactly like decimate's dm->last.
++    // All diff launches are enqueued first (one slice each), then ONE blocking read.
 +    for (i = 0; i < IVTC_CYCLE; i++) {
 +        AVFrame *prv = i ? ctx->cyc[i - 1] : ctx->dec_prev;
-+        if (!prv) {
-+            maxbdiff[i] = totdiff[i] = DBL_MAX;
-+        } else if ((err = ivtc_block_diffs(avctx, ctx->cyc[i], prv,
-+                                           &maxbdiff[i], &totdiff[i])) < 0)
++        if (prv && (err = ivtc_diff_enqueue(avctx, ctx->cyc[i], prv, i)) < 0)
 +            return err;
++    }
++    {
++        cl_int cle = clEnqueueReadBuffer(ctx->command_queue, ctx->diff_buf, CL_TRUE, 0,
++                                         ((size_t)(IVTC_CYCLE - 1) * ctx->diff_stride + ctx->nwg) * sizeof(cl_float),
++                                         ctx->diff_host, 0, NULL, NULL);
++        if (cle != CL_SUCCESS) { av_log(avctx, AV_LOG_ERROR, "diff readback: %d.\n", cle); return AVERROR(EIO); }
++        ivtc_release_inflight(ctx);
++    }
++    for (i = 0; i < IVTC_CYCLE; i++) {
++        AVFrame *prv = i ? ctx->cyc[i - 1] : ctx->dec_prev;
++        if (!prv)
++            maxbdiff[i] = totdiff[i] = DBL_MAX;
++        else
++            ivtc_diff_metrics(ctx, i, &maxbdiff[i], &totdiff[i]);
 +    }
 +
 +    for (i = 0; i < IVTC_CYCLE; i++) {
@@ -574,10 +652,10 @@ libavfilter/opencl_source.h.
 +        return AVERROR(ENOMEM);
 +    if ((err = av_frame_copy_props(out, cur)) < 0 ||
 +        (err = ivtc_synth(avctx, out, prev, cur, next, tff, match)) < 0) {
++        ivtc_sync_release(ctx);   // partial synth may be queued against `out`
 +        av_frame_free(&out);
 +        return err;
 +    }
-+    // matched output is progressive
 +    out->flags &= ~AV_FRAME_FLAG_INTERLACED;
 +    out->repeat_pict = 0;
 +
@@ -620,7 +698,9 @@ libavfilter/opencl_source.h.
 +        if ((err = ivtc_process(avctx, ctx->cur, ctx->next, ctx->next)) < 0)
 +            return err;
 +    }
-+    // Flush whatever remains in the cycle without dropping.
++    // Flush whatever remains in the cycle without dropping. No diff readback
++    // happens on this path, so sync explicitly before the frames leave.
++    ivtc_sync_release(ctx);
 +    for (i = 0; i < ctx->ncyc; i++) {
 +        err = ivtc_emit(avctx, ctx->cyc[i]);
 +        ctx->cyc[i] = NULL;
@@ -762,6 +842,34 @@ libavfilter/opencl_source.h.
 +    if ((ret = ff_opencl_filter_config_output2(outlink, &ctx->ocf)) < 0)
 +        return ret;
 +
++    // Plane image sizes exactly as hwcontext_opencl creates them: plane 0 and
++    // alpha planes are full size, other planes are width/wsub x height/hsub.
++    {
++        const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(ctx->ocf.output_format);
++        int wsub, hsub;
++        if (!desc)
++            return AVERROR(EINVAL);
++        wsub = 1 << desc->log2_chroma_w;
++        hsub = 1 << desc->log2_chroma_h;
++        ctx->nb_planes = av_pix_fmt_count_planes(ctx->ocf.output_format);
++        if (ctx->nb_planes < 1 || ctx->nb_planes > AV_NUM_DATA_POINTERS)
++            return AVERROR(EINVAL);
++        for (int p = 0; p < ctx->nb_planes; p++) {
++            int alpha = 0;
++            for (int c = 0; c < desc->nb_components; c++)
++                if (desc->comp[c].plane == p && (desc->flags & AV_PIX_FMT_FLAG_ALPHA) &&
++                    c == desc->nb_components - 1)
++                    alpha = 1;
++            if (p == 0 || alpha) {
++                ctx->plane_w[p] = outlink->w;
++                ctx->plane_h[p] = outlink->h;
++            } else {
++                ctx->plane_w[p] = outlink->w / wsub;
++                ctx->plane_h[p] = outlink->h / hsub;
++            }
++        }
++    }
++
 +    // vf_decimate-style timebase: derive the output rate from the input
 +    // frame_rate and the cycle:drop ratio (never hardcode it). The output
 +    // timebase is the decimated frame period, so one unit == one output frame.
@@ -809,6 +917,7 @@ libavfilter/opencl_source.h.
 +    cl_int cle;
 +    int i;
 +
++    ivtc_sync_release(ctx);   // GPU must be idle before frames/CL objects go away
 +    av_frame_free(&ctx->prev);
 +    av_frame_free(&ctx->cur);
 +    av_frame_free(&ctx->next);
@@ -819,6 +928,8 @@ libavfilter/opencl_source.h.
 +
 +    av_freep(&ctx->diff_host);
 +    av_freep(&ctx->cmp_host);
++    for (i = 0; i < IVTC_CYCLE; i++)
++        if (ctx->diff_sub[i]) clReleaseMemObject(ctx->diff_sub[i]);
 +    if (ctx->diff_buf)    clReleaseMemObject(ctx->diff_buf);
 +    if (ctx->absdiff_buf) clReleaseMemObject(ctx->absdiff_buf);
 +    if (ctx->flag_buf)    clReleaseMemObject(ctx->flag_buf);
@@ -888,7 +999,7 @@ libavfilter/opencl_source.h.
 +};
 --- /dev/null
 +++ b/libavfilter/opencl/ivtc.cl
-@@ -0,0 +1,317 @@
+@@ -0,0 +1,325 @@
 +/*
 + * Copyright (c) 2026
 + *
@@ -974,6 +1085,7 @@ libavfilter/opencl_source.h.
 + * scores[wg*IVTC_NCAND + m]; the host sums across work-groups and picks the
 + * lowest-energy candidate.
 + */
++// args: 0=prev 1=cur 2=next 3=width 4=height 5=tff 6=thresh 7=scores
 +__attribute__((reqd_work_group_size(IVTC_WG, IVTC_WG, 1)))
 +__kernel void ivtc_score(__read_only image2d_t prev,
 +                         __read_only image2d_t cur,
@@ -1023,6 +1135,7 @@ libavfilter/opencl_source.h.
 + * Synthesize the chosen field-match into dst. Works for any plane (luma R, or
 + * chroma RG) since it copies whole float4 samples per the candidate scheme.
 + */
++// args: 0=dst 1=prev 2=cur 3=next 4=tff 5=match
 +__kernel void ivtc_synthesize(__write_only image2d_t dst,
 +                              __read_only  image2d_t prev,
 +                              __read_only  image2d_t cur,
@@ -1048,6 +1161,7 @@ libavfilter/opencl_source.h.
 + * Luma SAD between two frames for decimation duplicate detection. Each
 + * work-group writes its partial sum to diffs[wg]; the host sums them.
 + */
++// args: 0=a 1=b 2=width 3=height 4=diffs
 +__attribute__((reqd_work_group_size(IVTC_WG, IVTC_WG, 1)))
 +__kernel void ivtc_diff(__read_only image2d_t a,
 +                        __read_only image2d_t b,
@@ -1093,6 +1207,7 @@ libavfilter/opencl_source.h.
 +}
 +
 +// |cur.borrowed - cand.borrowed| per borrowed field row -> D[fy*width + x] (0..255)
++// args: 0=cur 1=cand 2=width 3=hf 4=tff 5=D
 +__kernel void fm_absdiff(__read_only image2d_t cur,
 +                         __read_only image2d_t cand,
 +                         int width, int hf, int tff, __global uchar *D)
@@ -1107,6 +1222,7 @@ libavfilter/opencl_source.h.
 +}
 +
 +// build_diff_map: flag bits 1/2/4 per field-row diff magnitude + clustering.
++// args: 0=D 1=width 2=hf 3=F
 +__kernel void fm_diffmap(__global const uchar *D, int width, int hf,
 +                         __global uchar *F)
 +{
@@ -1161,6 +1277,7 @@ libavfilter/opencl_source.h.
 +
 +// compare_fields accumulation for match1=C (cur) vs match2=cand. Each WG writes
 +// 6 partials: {Ac,Am,Aml, Bc,Bm,Bml} -> out[wg*6 + 0..5]; host sums + decides.
++// args: 0=cur 1=cand 2=width 3=height 4=tff 5=F 6=hf 7=out
 +__attribute__((reqd_work_group_size(IVTC_WG, IVTC_WG, 1)))
 +__kernel void fm_compare_accum(__read_only image2d_t cur,
 +                               __read_only image2d_t cand,
@@ -1191,19 +1308,21 @@ libavfilter/opencl_source.h.
 +    }
 +
 +    __local float l[IVTC_WG * IVTC_WG * 6];
-+    l[tid*6+0]=Ac; l[tid*6+1]=Am; l[tid*6+2]=Aml;
-+    l[tid*6+3]=Bc; l[tid*6+4]=Bm; l[tid*6+5]=Bml;
++    // planar layout l[k*NT + tid] (avoids stride-6 bank conflicts)
++    const int NT = IVTC_WG * IVTC_WG;
++    l[0*NT+tid]=Ac; l[1*NT+tid]=Am; l[2*NT+tid]=Aml;
++    l[3*NT+tid]=Bc; l[4*NT+tid]=Bm; l[5*NT+tid]=Bml;
 +    barrier(CLK_LOCAL_MEM_FENCE);
 +    for (int s = (IVTC_WG * IVTC_WG) / 2; s > 0; s >>= 1) {
 +        if (tid < s)
 +            for (int k = 0; k < 6; k++)
-+                l[tid*6+k] += l[(tid+s)*6+k];
++                l[k*NT+tid] += l[k*NT+tid+s];
 +        barrier(CLK_LOCAL_MEM_FENCE);
 +    }
 +    if (tid == 0) {
 +        int wg = get_group_id(1) * get_num_groups(0) + get_group_id(0);
 +        for (int k = 0; k < 6; k++)
-+            out[wg*6+k] = l[k];
++            out[wg*6+k] = l[k*NT];
 +    }
 +}
 --- a/libavfilter/allfilters.c

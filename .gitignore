@@ -1,4 +1,5 @@
-.claude/**
+.claude
+.ref
 
 # Local fast-incremental build workspace (not committed; see Makefile).
 /src/
