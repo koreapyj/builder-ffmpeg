@@ -64,13 +64,20 @@ Deferred: compare_fields mN/scene-change (checkmm) fallback and chroma in the
 match metric (SW uses C/P only with chroma off-by-default-negligible here),
 BWDIF/deinterlace fallback for truly-interlaced / non-clean-telecine sections.
 
-Files: libavfilter/vf_ivtc_opencl.c, libavfilter/opencl/ivtc.cl (new),
+The backend-agnostic part (compare_fields decision, decimation cycle, RFF
+expansion, emit timing, activate) lives in ivtc_common.c / ivtc.h, shared with
+ivtc_cuda the way yadif_common.c is shared by the yadif/bwdif backends; the
+OpenCL filter only supplies the GPU hooks (match accumulators, synthesis,
+per-block diffs, sync).
+
+Files: libavfilter/vf_ivtc_opencl.c, libavfilter/opencl/ivtc.cl,
+libavfilter/ivtc.h, libavfilter/ivtc_common.c (new),
 libavfilter/allfilters.c, libavfilter/Makefile, configure,
 libavfilter/opencl_source.h.
 
 --- /dev/null
 +++ b/libavfilter/vf_ivtc_opencl.c
-@@ -0,0 +1,926 @@
+@@ -0,0 +1,460 @@
 +/*
 + * Copyright (c) 2026
 + *
@@ -102,43 +109,31 @@ libavfilter/opencl_source.h.
 +/*
 + * vf_ivtc_opencl -- hardware inverse telecine (field-matching) through OpenCL.
 + *
-+ * Phase 2: real 3:2 field-matching. For each input frame it scores the three
-+ * field-match candidates (C/P/N) for residual combing on the GPU, picks the
-+ * cleanest, and synthesizes the matched progressive frame. Matched frames are
-+ * accumulated into a 5-frame cycle and the most-redundant one (lowest luma SAD
-+ * to its predecessor) is dropped, yielding 23.976 CFR from 29.97 hard telecine.
++ * The OpenCL backend of the shared ivtc core (ivtc_common.c): it scores the
++ * field-match candidates for residual combing on the GPU, synthesizes the
++ * matched progressive frame and computes the per-block decimation diffs. The
++ * match decision, 5-frame decimation cycle, RFF expansion and emit timing are
++ * in ivtc_common.c.
 + *
-+ * Kernels live in opencl/ivtc.cl. Deferred to a later phase: cadence
-+ * lock/hysteresis, confidence layer, BWDIF fallback for truly-interlaced
-+ * sections, and RFF/soft-pulldown expansion.
-+ *
-+ * Validated end-to-end on the zero-copy QSV chain:
++ * Kernels live in opencl/ivtc.cl. Validated end-to-end on the zero-copy QSV chain:
 + *   hwmap=derive_device=opencl, ivtc_opencl, hwmap=derive_device=qsv:reverse=1
 + */
 +
-+#include <inttypes.h>
-+#include <float.h>
-+
 +#include "libavutil/buffer.h"
 +#include "libavutil/hwcontext.h"
-+#include "libavutil/mathematics.h"
 +#include "libavutil/mem.h"
 +#include "libavutil/opt.h"
 +#include "libavutil/pixdesc.h"
 +
 +#include "avfilter.h"
 +#include "filters.h"
++#include "ivtc.h"
 +#include "opencl.h"
 +#include "opencl_source.h"
 +#include "video.h"
 +
-+#define IVTC_WG 16
-+#define IVTC_CYCLE 5
-+#define IVTC_INFLIGHT_MAX 12   // refs held between blocking reads (3 per synth)
-+#define IVTC_NCAND 5          // field-match candidates: C, P, N, B, U
-+
 +typedef struct IvtcOpenCLContext {
-+    const AVClass *class;
++    IVTCContext ivtc;
 +
 +    OpenCLFilterContext ocf;
 +    cl_command_queue command_queue;
@@ -147,7 +142,6 @@ libavfilter/opencl_source.h.
 +    cl_kernel kernel_absdiff;     // fm_absdiff: |cur.bf - cand.bf| per field row
 +    cl_kernel kernel_diffmap;     // fm_diffmap: build_diff_map flags
 +    cl_kernel kernel_compare;     // fm_compare_accum: compare_fields accumulators
-+    int initialised;
 +
 +    cl_mem    diff_buf;           // per-WG luma SAD partials (IVTC_CYCLE slices of diff_stride floats)
 +    cl_mem    diff_sub[IVTC_CYCLE]; // sub-buffer per slice of diff_buf
@@ -157,72 +151,9 @@ libavfilter/opencl_source.h.
 +    cl_mem    cmp_buf;            // per-WG compare_fields partials (nwg*6 float)
 +    float    *diff_host;
 +    float    *cmp_host;
-+    int       nwg, nwgx, nwgy;    // work-group grid over the luma plane
-+    int       luma_w, luma_h, luma_hf;  // luma_hf = luma_h/2 (borrowed field rows)
 +    int       nb_planes;          // cached output plane count / dimensions
 +    size_t    plane_w[AV_NUM_DATA_POINTERS], plane_h[AV_NUM_DATA_POINTERS];
-+
-+    // frames still referenced by enqueued, not yet synchronised GPU work
-+    AVFrame  *inflight[IVTC_INFLIGHT_MAX];
-+    int       n_inflight;
-+
-+    // options
-+    int     tff_opt;              // -1 auto, 0 BFF, 1 TFF
-+    float   cthresh;              // combing tolerance (8-bit units)
-+    double  dupthresh_flt;        // duplicate threshold (% of block max), like vf_decimate
-+    double  scthresh_flt;         // scene-change threshold (% of frame max)
-+    int     verbose;
-+
-+    // decimation thresholds, derived in config_output (normalized-float units)
-+    double  dupthresh;            // max_bdiff below this => frame is a duplicate
-+    double  scthresh;             // tot_diff above this  => scene change
-+
-+    // 3-frame match window (input refs)
-+    AVFrame *prev, *cur, *next;
-+
-+    // decimation cycle of matched frames + cross-cycle predecessor
-+    AVFrame *cyc[IVTC_CYCLE];
-+    int      ncyc;
-+    AVFrame *dec_prev;           // last emitted matched frame (ref)
-+
-+    // emit timing -- mirrors vf_decimate: output timebase/rate derived from the
-+    // input frame_rate, output pts anchored to the first kept frame's real pts.
-+    AVRational in_tb;            // input time_base
-+    AVRational dec_tb;           // output (decimated) frame period = (1/fps)*cycle/(cycle-1)
-+    int64_t  start_pts;          // first kept frame's pts, rescaled to dec_tb
-+    int64_t  last_pts;           // last emitted pts (dec_tb units)
-+    int64_t  last_duration;      // last emitted duration (dec_tb units)
-+
-+    // soft-pulldown (RFF) expansion: qsv strips repeat_pict, but the 2:3 cadence
-+    // survives in the inter-frame PTS spans. Re-materialise each frame onto the
-+    // display-field grid so soft telecine (24p, spans 2,3,2,3 fields) becomes a
-+    // uniform field-rate stream the matcher + 5:4 decimation invert exactly. Hard
-+    // telecine / true 30p have uniform spans == exp_base => exactly one feed.
-+    int64_t  exp_base;           // one display-frame interval, in in_tb units
-+    int64_t  exp_acc;            // accumulated span not yet emitted to the grid
-+    AVFrame *exp_pending;        // buffered input frame awaiting its span
-+
-+    int      eof;
-+    uint64_t in_count, out_count, match_c, match_p, match_n;
 +} IvtcOpenCLContext;
-+
-+// ---- small helpers -------------------------------------------------------
-+
-+// Drop the frame refs held for in-flight GPU work. Only call right after a
-+// blocking read / clFinish on the (in-order) command queue.
-+static void ivtc_release_inflight(IvtcOpenCLContext *ctx)
-+{
-+    while (ctx->n_inflight > 0)
-+        av_frame_free(&ctx->inflight[--ctx->n_inflight]);
-+}
-+
-+// Full sync + release (explicit paths: error, flush, uninit).
-+static void ivtc_sync_release(IvtcOpenCLContext *ctx)
-+{
-+    if (ctx->command_queue)
-+        clFinish(ctx->command_queue);
-+    ivtc_release_inflight(ctx);
-+}
 +
 +static int ivtc_set_arg(AVFilterContext *avctx, cl_kernel k, int idx,
 +                        size_t sz, const void *val)
@@ -235,11 +166,11 @@ libavfilter/opencl_source.h.
 +    return 0;
 +}
 +
-+static int ivtc_resolve_tff(IvtcOpenCLContext *ctx, const AVFrame *f)
++static void ivtc_cl_sync(AVFilterContext *avctx)
 +{
-+    if (ctx->tff_opt >= 0)
-+        return ctx->tff_opt;
-+    return (f->flags & AV_FRAME_FLAG_TOP_FIELD_FIRST) ? 1 : 0;
++    IvtcOpenCLContext *ctx = avctx->priv;
++    if (ctx->command_queue)
++        clFinish(ctx->command_queue);
 +}
 +
 +// ---- one-time GPU init (queue, kernels, score/diff buffers) ---------------
@@ -247,6 +178,7 @@ libavfilter/opencl_source.h.
 +static int ivtc_init_cl(AVFilterContext *avctx)
 +{
 +    IvtcOpenCLContext *ctx = avctx->priv;
++    IVTCContext *s = &ctx->ivtc;
 +    cl_int cle;
 +    int err;
 +
@@ -271,13 +203,6 @@ libavfilter/opencl_source.h.
 +    ctx->kernel_compare = clCreateKernel(ctx->ocf.program, "fm_compare_accum", &cle);
 +    if (!ctx->kernel_compare) { av_log(avctx, AV_LOG_ERROR, "kernel fm_compare_accum: %d.\n", cle); return AVERROR(EIO); }
 +
-+    ctx->luma_w  = ctx->ocf.output_width;
-+    ctx->luma_h  = ctx->ocf.output_height;
-+    ctx->luma_hf = ctx->luma_h / 2;
-+    ctx->nwgx = (ctx->luma_w + IVTC_WG - 1) / IVTC_WG;
-+    ctx->nwgy = (ctx->luma_h + IVTC_WG - 1) / IVTC_WG;
-+    ctx->nwg  = ctx->nwgx * ctx->nwgy;
-+
 +    {
 +        cl_uint align_bits = 0;
 +        size_t align, stride_bytes;
@@ -286,36 +211,36 @@ libavfilter/opencl_source.h.
 +        align = (cle == CL_SUCCESS && align_bits >= 8) ? align_bits / 8 : 1024;
 +        if (align < sizeof(cl_float))
 +            align = sizeof(cl_float);
-+        stride_bytes = FFALIGN((size_t)ctx->nwg * sizeof(cl_float), align);
++        stride_bytes = FFALIGN((size_t)s->nwg * sizeof(cl_float), align);
 +        ctx->diff_stride = stride_bytes / sizeof(cl_float);
 +        ctx->diff_buf = clCreateBuffer(ctx->ocf.hwctx->context, CL_MEM_READ_WRITE,
 +                                       stride_bytes * IVTC_CYCLE, NULL, &cle);
 +        if (!ctx->diff_buf) { av_log(avctx, AV_LOG_ERROR, "diff_buf: %d.\n", cle); return AVERROR(EIO); }
 +        for (int i = 0; i < IVTC_CYCLE; i++) {
-+            cl_buffer_region reg = { stride_bytes * i, (size_t)ctx->nwg * sizeof(cl_float) };
++            cl_buffer_region reg = { stride_bytes * i, (size_t)s->nwg * sizeof(cl_float) };
 +            ctx->diff_sub[i] = clCreateSubBuffer(ctx->diff_buf, CL_MEM_READ_WRITE,
 +                                                 CL_BUFFER_CREATE_TYPE_REGION, &reg, &cle);
 +            if (!ctx->diff_sub[i]) { av_log(avctx, AV_LOG_ERROR, "diff sub-buffer %d: %d.\n", i, cle); return AVERROR(EIO); }
 +        }
 +    }
 +    ctx->absdiff_buf = clCreateBuffer(ctx->ocf.hwctx->context, CL_MEM_READ_WRITE,
-+                                      (size_t)ctx->luma_w * ctx->luma_hf, NULL, &cle);
++                                      (size_t)s->luma_w * s->luma_hf, NULL, &cle);
 +    if (!ctx->absdiff_buf) { av_log(avctx, AV_LOG_ERROR, "absdiff_buf: %d.\n", cle); return AVERROR(EIO); }
 +    ctx->flag_buf = clCreateBuffer(ctx->ocf.hwctx->context, CL_MEM_READ_WRITE,
-+                                   (size_t)ctx->luma_w * ctx->luma_hf, NULL, &cle);
++                                   (size_t)s->luma_w * s->luma_hf, NULL, &cle);
 +    if (!ctx->flag_buf) { av_log(avctx, AV_LOG_ERROR, "flag_buf: %d.\n", cle); return AVERROR(EIO); }
 +    ctx->cmp_buf = clCreateBuffer(ctx->ocf.hwctx->context, CL_MEM_WRITE_ONLY,
-+                                  ctx->nwg * 6 * sizeof(cl_float), NULL, &cle);
++                                  s->nwg * 6 * sizeof(cl_float), NULL, &cle);
 +    if (!ctx->cmp_buf) { av_log(avctx, AV_LOG_ERROR, "cmp_buf: %d.\n", cle); return AVERROR(EIO); }
 +
 +    ctx->diff_host = av_calloc((size_t)ctx->diff_stride * IVTC_CYCLE, sizeof(float));
-+    ctx->cmp_host  = av_malloc_array(ctx->nwg, 6 * sizeof(float));
++    ctx->cmp_host  = av_malloc_array(s->nwg, 6 * sizeof(float));
 +    if (!ctx->diff_host || !ctx->cmp_host)
 +        return AVERROR(ENOMEM);
 +
 +    // Constant kernel args (indices match the signatures in opencl/ivtc.cl).
 +    {
-+        cl_int w = ctx->luma_w, h = ctx->luma_h, hf = ctx->luma_hf;
++        cl_int w = s->luma_w, h = s->luma_h, hf = s->luma_hf;
 +        int e = 0;
 +        // fm_absdiff(cur, cand, width, hf, tff, D)
 +        e |= ivtc_set_arg(avctx, ctx->kernel_absdiff, 2, sizeof(w), &w);
@@ -339,55 +264,26 @@ libavfilter/opencl_source.h.
 +            return AVERROR(EIO);
 +    }
 +
-+    ctx->initialised = 1;
 +    return 0;
 +}
 +
 +// ---- kernel launches ------------------------------------------------------
 +
-+// compare_fields decision (vf_fieldmatch.c:586-608). a = match1 accumulators
-+// {c,m,ml}, b = match2. Returns 1 if match2 wins, 0 if match1.
-+static int ivtc_decide(const double a[3], const double b[3])
-+{
-+    double Am = a[1], Bm = b[1], Aml = a[2], Bml = b[2];
-+    int norm1, norm2, mtn1, mtn2;
-+    double c1, c2, mr;
-+
-+    if (Am < 500 && Bm < 500 && (Aml >= 500 || Bml >= 500) &&
-+        FFMAX(Aml, Bml) > 3 * FFMIN(Aml, Bml)) { Am = Aml; Bm = Bml; }
-+    norm1 = (int)(a[0] / 6.0 + 0.5); norm2 = (int)(b[0] / 6.0 + 0.5);
-+    mtn1  = (int)(Am   / 6.0 + 0.5); mtn2  = (int)(Bm   / 6.0 + 0.5);
-+    c1 = (double)FFMAX(norm1, norm2) / FFMAX(FFMIN(norm1, norm2), 1);
-+    c2 = (double)FFMAX(mtn1,  mtn2)  / FFMAX(FFMIN(mtn1,  mtn2),  1);
-+    mr = (double)FFMAX(mtn1,  mtn2)  / FFMAX(FFMAX(norm1, norm2), 1);
-+    if (((mtn1 >=  500 || mtn2 >=  500) && (mtn1*2 < mtn2   || mtn2*2 < mtn1))   ||
-+        ((mtn1 >= 1000 || mtn2 >= 1000) && (mtn1*3 < mtn2*2 || mtn2*3 < mtn1*2)) ||
-+        ((mtn1 >= 2000 || mtn2 >= 2000) && (mtn1*5 < mtn2*4 || mtn2*5 < mtn1*4)) ||
-+        ((mtn1 >= 4000 || mtn2 >= 4000) && c2 > c1))
-+        return mtn1 > mtn2 ? 1 : 0;
-+    else if (mr > 0.005 && FFMAX(mtn1, mtn2) > 150 && (mtn1*2 < mtn2 || mtn2*2 < mtn1))
-+        return mtn1 > mtn2 ? 1 : 0;
-+    else
-+        return norm1 > norm2 ? 1 : 0;
-+}
-+
-+// Field-match via vf_fieldmatch compare_fields (Stage 1: C vs P primary, default
-+// mode pc_n). GPU computes the motion-mask + masked combing accumulators in three
-+// chained kernels; one readback brings back per-WG partials; the host runs the
-+// scalar decision. Returns match 0=C, 1=P. (next reserved for the scene-change /
-+// mN fallback added in Stage 2.)
-+static int ivtc_pick_match(AVFilterContext *avctx, cl_mem prev, cl_mem cur,
-+                           cl_mem next, int tff, int *out_match)
++// compare_fields accumulators (C vs P) in three chained kernels, then one
++// blocking readback of the per-WG partials, summed here.
++static int ivtc_cl_match_accum(AVFilterContext *avctx, AVFrame *prevf, AVFrame *curf,
++                               AVFrame *nextf, int tff, double A[3], double B[3])
 +{
 +    IvtcOpenCLContext *ctx = avctx->priv;
++    IVTCContext *s = &ctx->ivtc;
++    cl_mem prev = (cl_mem)prevf->data[0], cur = (cl_mem)curf->data[0];
 +    cl_int cle, ctff = tff;
-+    size_t gf[2]  = { (size_t)ctx->luma_w, (size_t)ctx->luma_hf };
-+    size_t gw[2]  = { (size_t)ctx->nwgx * IVTC_WG, (size_t)ctx->nwgy * IVTC_WG };
++    size_t gf[2]  = { (size_t)s->luma_w, (size_t)s->luma_hf };
++    size_t gw[2]  = { (size_t)s->nwgx * IVTC_WG, (size_t)s->nwgy * IVTC_WG };
 +    size_t loc[2] = { IVTC_WG, IVTC_WG };
-+    double A[3] = { 0, 0, 0 }, B[3] = { 0, 0, 0 };
-+    int err, i, m;
++    int err, i;
 +
-+    (void)next;
++    (void)nextf;
 +
 +    if ((err = ivtc_set_arg(avctx, ctx->kernel_absdiff, 0, sizeof(cl_mem), &cur)) < 0 ||
 +        (err = ivtc_set_arg(avctx, ctx->kernel_absdiff, 1, sizeof(cl_mem), &prev)) < 0 ||
@@ -407,33 +303,23 @@ libavfilter/opencl_source.h.
 +    if (cle != CL_SUCCESS) { av_log(avctx, AV_LOG_ERROR, "compare enqueue: %d.\n", cle); return AVERROR(EIO); }
 +
 +    cle = clEnqueueReadBuffer(ctx->command_queue, ctx->cmp_buf, CL_TRUE, 0,
-+                              ctx->nwg * 6 * sizeof(cl_float), ctx->cmp_host, 0, NULL, NULL);
++                              s->nwg * 6 * sizeof(cl_float), ctx->cmp_host, 0, NULL, NULL);
 +    if (cle != CL_SUCCESS) { av_log(avctx, AV_LOG_ERROR, "cmp readback: %d.\n", cle); return AVERROR(EIO); }
-+    // blocking read on the in-order queue: all earlier work (incl. prior synths) is done
-+    ivtc_release_inflight(ctx);
 +
-+    for (i = 0; i < ctx->nwg; i++) {
++    for (i = 0; i < s->nwg; i++) {
 +        A[0] += ctx->cmp_host[i*6+0]; A[1] += ctx->cmp_host[i*6+1]; A[2] += ctx->cmp_host[i*6+2];
 +        B[0] += ctx->cmp_host[i*6+3]; B[1] += ctx->cmp_host[i*6+4]; B[2] += ctx->cmp_host[i*6+5];
 +    }
-+    m = ivtc_decide(A, B);   // 0 = C (match1), 1 = P (match2)
-+    *out_match = m;
-+    av_log(avctx, AV_LOG_DEBUG, "ivtc match: C(c=%.0f m=%.0f) P(c=%.0f m=%.0f) -> %c\n",
-+           A[0], A[1], B[0], B[1], "CP"[m]);
 +    return 0;
 +}
 +
 +// Synthesize the chosen match into dst (all planes).
-+static int ivtc_synth(AVFilterContext *avctx, AVFrame *dst, AVFrame *prev,
-+                      AVFrame *cur, AVFrame *next, int tff, int match)
++static int ivtc_cl_synth(AVFilterContext *avctx, AVFrame *dst, AVFrame *prev,
++                         AVFrame *cur, AVFrame *next, int tff, int match)
 +{
 +    IvtcOpenCLContext *ctx = avctx->priv;
 +    cl_int cle, ctff = tff, cmatch = match;
 +    int err, p;
-+
-+    // make room: if a caller ever queues more synths than fit, sync first
-+    if (ctx->n_inflight + 3 > IVTC_INFLIGHT_MAX)
-+        ivtc_sync_release(ctx);
 +
 +    if ((err = ivtc_set_arg(avctx, ctx->kernel_synth, 4, sizeof(cl_int), &ctff)) < 0 ||
 +        (err = ivtc_set_arg(avctx, ctx->kernel_synth, 5, sizeof(cl_int), &cmatch)) < 0)
@@ -452,346 +338,46 @@ libavfilter/opencl_source.h.
 +                                     global, NULL, 0, NULL, NULL);
 +        if (cle != CL_SUCCESS) { av_log(avctx, AV_LOG_ERROR, "synth enqueue plane %d: %d.\n", p, cle); return AVERROR(EIO); }
 +    }
-+
-+    // No clFinish: hold refs on the input frames until the next blocking read so
-+    // their buffers cannot return to the upstream pool while the GPU still reads them.
-+    ctx->inflight[ctx->n_inflight] = av_frame_clone(prev);
-+    if (!ctx->inflight[ctx->n_inflight])
-+        return AVERROR(ENOMEM);
-+    ctx->n_inflight++;
-+    ctx->inflight[ctx->n_inflight] = av_frame_clone(cur);
-+    if (!ctx->inflight[ctx->n_inflight])
-+        return AVERROR(ENOMEM);
-+    ctx->n_inflight++;
-+    ctx->inflight[ctx->n_inflight] = av_frame_clone(next);
-+    if (!ctx->inflight[ctx->n_inflight])
-+        return AVERROR(ENOMEM);
-+    ctx->n_inflight++;
 +    return 0;
 +}
 +
-+// Per-block luma diff between two matched frames, reduced to vf_decimate's two
-+// metrics. The ivtc_diff kernel already emits one abs-diff sum per 16x16 block
-+// (work-group) into diff_host laid out as nwgy rows x nwgx cols; here we only
-+// reduce that small grid on the host -- the per-pixel work stayed on the GPU.
-+//   totdiff  = sum of all blocks                  (global; scene-change signal)
-+//   maxbdiff = max over overlapping 2x2-block (32x32 px) windows  (localized)
-+// Ranking duplicates by maxbdiff -- not the global sum -- is what makes limited-
-+// animation frames (small moving region, low global sum, high local diff) lose
-+// to the true woven duplicate (low diff everywhere), matching vf_decimate.
-+static int ivtc_diff_enqueue(AVFilterContext *avctx, AVFrame *a, AVFrame *b, int slice)
++// ivtc_diff emits one abs-diff sum per 16x16 block (work-group) into its slice;
++// all launches are enqueued first, then ONE blocking read of the whole buffer.
++static int ivtc_cl_diff_cycle(AVFilterContext *avctx, AVFrame *const a[IVTC_CYCLE],
++                              AVFrame *const b[IVTC_CYCLE], const float **sums, int *stride)
 +{
 +    IvtcOpenCLContext *ctx = avctx->priv;
-+    cl_int cle;
-+    cl_mem ma = (cl_mem)a->data[0], mb = (cl_mem)b->data[0];
-+    size_t global[2] = { (size_t)ctx->nwgx * IVTC_WG, (size_t)ctx->nwgy * IVTC_WG };
++    IVTCContext *s = &ctx->ivtc;
++    size_t global[2] = { (size_t)s->nwgx * IVTC_WG, (size_t)s->nwgy * IVTC_WG };
 +    size_t local[2]  = { IVTC_WG, IVTC_WG };
-+    int err;
-+    if ((err = ivtc_set_arg(avctx, ctx->kernel_diff, 0, sizeof(cl_mem), &ma)) < 0 ||
-+        (err = ivtc_set_arg(avctx, ctx->kernel_diff, 1, sizeof(cl_mem), &mb)) < 0 ||
-+        (err = ivtc_set_arg(avctx, ctx->kernel_diff, 4, sizeof(cl_mem), &ctx->diff_sub[slice])) < 0)
-+        return err;
-+    cle = clEnqueueNDRangeKernel(ctx->command_queue, ctx->kernel_diff, 2, NULL,
-+                                 global, local, 0, NULL, NULL);
-+    if (cle != CL_SUCCESS) { av_log(avctx, AV_LOG_ERROR, "diff enqueue: %d.\n", cle); return AVERROR(EIO); }
-+    return 0;
-+}
++    cl_int cle;
++    int err, i;
 +
-+static void ivtc_diff_metrics(IvtcOpenCLContext *ctx, int slice,
-+                              double *maxbdiff, double *totdiff)
-+{
-+    const float *dh = ctx->diff_host + (size_t)slice * ctx->diff_stride;
-+    int i, j;
-+    double tot = 0.0, mx = -1.0;
-+
-+    for (i = 0; i < ctx->nwg; i++)
-+        tot += dh[i];
-+    for (i = 0; i < ctx->nwgy - 1; i++) {
-+        for (j = 0; j < ctx->nwgx - 1; j++) {
-+            double t = (double)dh[ i      * ctx->nwgx + j    ]
-+                     + (double)dh[ i      * ctx->nwgx + j + 1]
-+                     + (double)dh[(i + 1) * ctx->nwgx + j    ]
-+                     + (double)dh[(i + 1) * ctx->nwgx + j + 1];
-+            if (t > mx)
-+                mx = t;
-+        }
-+    }
-+    *totdiff  = tot;
-+    *maxbdiff = mx < 0.0 ? tot : mx;   // grids smaller than 2x2 fall back to total
-+}
-+
-+// ---- emit + decimation ----------------------------------------------------
-+
-+// Emit a kept frame, stamping its output PTS from the input frame's own PTS
-+// rescaled to the decimated output timebase (then forced strictly increasing).
-+// On clean telecine the 4 kept frames of each 5-cycle rescale onto consecutive
-+// output slots == a uniform 23.976 grid (smooth, same as vf_decimate). When the
-+// input under-delivers (decode/PCR gaps), that gap carries straight through to
-+// the output PTS, so the downstream CFR encoder fills it with a SINGLE, spread
-+// duplicate at the gap -- exactly like vpp_deinterlace's 1:1 passthrough --
-+// instead of the old free-running-grid + drift-guard which accumulated drift and
-+// then jumped, bunching the compensation into visible dup bursts ("reduced
-+// frames"). The PTS still tracks the input timeline, so A/V cannot drift.
-+static int ivtc_emit(AVFilterContext *avctx, AVFrame *frame)
-+{
-+    IvtcOpenCLContext *ctx = avctx->priv;
-+    AVFilterLink *outlink = avctx->outputs[0];
-+    int64_t in_pts = frame->pts;   // matched frame's real input pts (in_tb)
-+    int64_t want;
-+
-+    // Emit a contiguous 23.976 grid: anchor the first kept frame to the input's
-+    // real pts (A/V alignment), then free-run +1 per kept frame. We do NOT track
-+    // input pts per frame -- on soft pulldown its 2:3 cadence is non-uniform, and
-+    // carrying that through would leave holes the CFR/HLS muxer dup-fills (the
-+    // judder). RFF expansion above keeps the kept-frame count matched to the
-+    // content duration, so a contiguous grid stays A/V-synced.
-+    if (ctx->out_count == 0)
-+        want = (in_pts != AV_NOPTS_VALUE) ? av_rescale_q(in_pts, ctx->in_tb, ctx->dec_tb)
-+                                          : 0;
-+    else
-+        want = ctx->last_pts + 1;
-+
-+    frame->pts      = want;
-+    frame->duration = 1;
-+    ctx->last_pts   = want;
-+    ctx->out_count++;
-+    return ff_filter_frame(outlink, frame);
-+}
-+
-+// Drop one frame of the full cycle, emit the other four. Selection mirrors
-+// vf_decimate::filter_frame: drop the lowest-maxbdiff frame (the duplicate); if
-+// the cycle has no frame below dupthresh but does contain a scene change, drop
-+// the scene-change frame instead of a real unique one.
-+static int ivtc_decimate(AVFilterContext *avctx)
-+{
-+    IvtcOpenCLContext *ctx = avctx->priv;
-+    double maxbdiff[IVTC_CYCLE], totdiff[IVTC_CYCLE];
-+    int scpos = -1, duppos = -1, drop, lowest = 0, i, err;
-+
-+    // metric of each frame vs its temporal predecessor; cyc[0]'s predecessor is
-+    // the previous cycle's last frame (dec_prev), exactly like decimate's dm->last.
-+    // All diff launches are enqueued first (one slice each), then ONE blocking read.
 +    for (i = 0; i < IVTC_CYCLE; i++) {
-+        AVFrame *prv = i ? ctx->cyc[i - 1] : ctx->dec_prev;
-+        if (prv && (err = ivtc_diff_enqueue(avctx, ctx->cyc[i], prv, i)) < 0)
++        cl_mem ma, mb;
++        if (!b[i])
++            continue;
++        ma = (cl_mem)a[i]->data[0];
++        mb = (cl_mem)b[i]->data[0];
++        if ((err = ivtc_set_arg(avctx, ctx->kernel_diff, 0, sizeof(cl_mem), &ma)) < 0 ||
++            (err = ivtc_set_arg(avctx, ctx->kernel_diff, 1, sizeof(cl_mem), &mb)) < 0 ||
++            (err = ivtc_set_arg(avctx, ctx->kernel_diff, 4, sizeof(cl_mem), &ctx->diff_sub[i])) < 0)
 +            return err;
++        cle = clEnqueueNDRangeKernel(ctx->command_queue, ctx->kernel_diff, 2, NULL,
++                                     global, local, 0, NULL, NULL);
++        if (cle != CL_SUCCESS) { av_log(avctx, AV_LOG_ERROR, "diff enqueue: %d.\n", cle); return AVERROR(EIO); }
 +    }
-+    {
-+        cl_int cle = clEnqueueReadBuffer(ctx->command_queue, ctx->diff_buf, CL_TRUE, 0,
-+                                         ((size_t)(IVTC_CYCLE - 1) * ctx->diff_stride + ctx->nwg) * sizeof(cl_float),
-+                                         ctx->diff_host, 0, NULL, NULL);
-+        if (cle != CL_SUCCESS) { av_log(avctx, AV_LOG_ERROR, "diff readback: %d.\n", cle); return AVERROR(EIO); }
-+        ivtc_release_inflight(ctx);
-+    }
-+    for (i = 0; i < IVTC_CYCLE; i++) {
-+        AVFrame *prv = i ? ctx->cyc[i - 1] : ctx->dec_prev;
-+        if (!prv)
-+            maxbdiff[i] = totdiff[i] = DBL_MAX;
-+        else
-+            ivtc_diff_metrics(ctx, i, &maxbdiff[i], &totdiff[i]);
-+    }
++    cle = clEnqueueReadBuffer(ctx->command_queue, ctx->diff_buf, CL_TRUE, 0,
++                              ((size_t)(IVTC_CYCLE - 1) * ctx->diff_stride + s->nwg) * sizeof(cl_float),
++                              ctx->diff_host, 0, NULL, NULL);
++    if (cle != CL_SUCCESS) { av_log(avctx, AV_LOG_ERROR, "diff readback: %d.\n", cle); return AVERROR(EIO); }
 +
-+    for (i = 0; i < IVTC_CYCLE; i++) {
-+        if (totdiff[i] > ctx->scthresh)
-+            scpos = i;
-+        if (maxbdiff[i] < maxbdiff[lowest])
-+            lowest = i;
-+    }
-+    if (maxbdiff[lowest] < ctx->dupthresh)
-+        duppos = lowest;
-+    drop = (scpos >= 0 && duppos < 0) ? scpos : lowest;
-+
-+    if (av_log_get_level() >= AV_LOG_DEBUG) {
-+        av_log(avctx, AV_LOG_DEBUG, "ivtc 1/%d drop:\n", IVTC_CYCLE);
-+        for (i = 0; i < IVTC_CYCLE; i++)
-+            av_log(avctx, AV_LOG_DEBUG, "  #%d maxbdiff=%.1f totdiff=%.1f%s%s%s%s\n",
-+                   i, maxbdiff[i], totdiff[i],
-+                   i == scpos ? " sc" : "", i == duppos ? " dup" : "",
-+                   i == lowest ? " lowest" : "", i == drop ? " [DROP]" : "");
-+    }
-+
-+    // predecessor for next cycle's frame 0 = this cycle's last frame (decimate's
-+    // dm->last is cloned from the cycle's final frame regardless of the drop).
-+    av_frame_free(&ctx->dec_prev);
-+    ctx->dec_prev = av_frame_clone(ctx->cyc[IVTC_CYCLE - 1]);
-+
-+    for (i = 0; i < IVTC_CYCLE; i++) {
-+        if (i == drop) {
-+            av_frame_free(&ctx->cyc[i]);
-+        } else {
-+            err = ivtc_emit(avctx, ctx->cyc[i]);   // takes ownership
-+            ctx->cyc[i] = NULL;
-+            if (err < 0)
-+                return err;
-+        }
-+        ctx->cyc[i] = NULL;
-+    }
-+    ctx->ncyc = 0;
-+    return 0;
-+}
-+
-+// Field-match `cur` (using prev/next), synthesize, push to the cycle.
-+static int ivtc_process(AVFilterContext *avctx, AVFrame *prev, AVFrame *cur, AVFrame *next)
-+{
-+    IvtcOpenCLContext *ctx = avctx->priv;
-+    AVFilterLink *outlink = avctx->outputs[0];
-+    int tff = ivtc_resolve_tff(ctx, cur);
-+    int match = 0, err;
-+    AVFrame *out;
-+
-+    if (!ctx->initialised && (err = ivtc_init_cl(avctx)) < 0)
-+        return err;
-+
-+    if ((err = ivtc_pick_match(avctx, (cl_mem)prev->data[0], (cl_mem)cur->data[0],
-+                               (cl_mem)next->data[0], tff, &match)) < 0)
-+        return err;
-+    if (match == 0) ctx->match_c++; else if (match == 1) ctx->match_p++; else ctx->match_n++;
-+
-+    out = ff_get_video_buffer(outlink, outlink->w, outlink->h);
-+    if (!out)
-+        return AVERROR(ENOMEM);
-+    if ((err = av_frame_copy_props(out, cur)) < 0 ||
-+        (err = ivtc_synth(avctx, out, prev, cur, next, tff, match)) < 0) {
-+        ivtc_sync_release(ctx);   // partial synth may be queued against `out`
-+        av_frame_free(&out);
-+        return err;
-+    }
-+    out->flags &= ~AV_FRAME_FLAG_INTERLACED;
-+    out->repeat_pict = 0;
-+
-+    ctx->cyc[ctx->ncyc++] = out;
-+    if (ctx->ncyc >= IVTC_CYCLE)
-+        return ivtc_decimate(avctx);
++    *sums   = ctx->diff_host;
++    *stride = ctx->diff_stride;
 +    return 0;
 +}
 +
 +// ---- filter plumbing ------------------------------------------------------
-+
-+// Slide the 3-frame match window and process. Takes ownership of `in`.
-+static int ivtc_feed(AVFilterContext *avctx, AVFrame *in)
-+{
-+    IvtcOpenCLContext *ctx = avctx->priv;
-+    av_frame_free(&ctx->prev);
-+    ctx->prev = ctx->cur;
-+    ctx->cur  = ctx->next;
-+    ctx->next = in;
-+    if (!ctx->cur)
-+        return 0;   // need at least cur+next before matching
-+    return ivtc_process(avctx, ctx->prev ? ctx->prev : ctx->cur, ctx->cur, ctx->next);
-+}
-+
-+static int ivtc_drain(AVFilterContext *avctx)
-+{
-+    IvtcOpenCLContext *ctx = avctx->priv;
-+    int err, i;
-+
-+    // flush the frame held back for span computation before draining the window
-+    if (ctx->exp_pending) {
-+        AVFrame *last = ctx->exp_pending;
-+        ctx->exp_pending = NULL;
-+        if ((err = ivtc_feed(avctx, last)) < 0)
-+            return err;
-+    }
-+
-+    // Process the final buffered frame (next), aliasing its own next.
-+    if (ctx->next && ctx->cur) {
-+        if ((err = ivtc_process(avctx, ctx->cur, ctx->next, ctx->next)) < 0)
-+            return err;
-+    }
-+    // Flush whatever remains in the cycle without dropping. No diff readback
-+    // happens on this path, so sync explicitly before the frames leave.
-+    ivtc_sync_release(ctx);
-+    for (i = 0; i < ctx->ncyc; i++) {
-+        err = ivtc_emit(avctx, ctx->cyc[i]);
-+        ctx->cyc[i] = NULL;
-+        if (err < 0)
-+            return err;
-+    }
-+    ctx->ncyc = 0;
-+    return 0;
-+}
-+
-+static int ivtc_filter_frame(AVFilterLink *inlink, AVFrame *in)
-+{
-+    AVFilterContext *avctx = inlink->dst;
-+    IvtcOpenCLContext *ctx = avctx->priv;
-+
-+    int err, n;
-+
-+    ctx->in_count++;
-+    if (ctx->verbose)
-+        av_log(avctx, AV_LOG_VERBOSE,
-+               "ivtc IN #%"PRIu64": pts=%"PRId64" repeat_pict=%d TFF=%d INTERLACED=%d\n",
-+               ctx->in_count - 1, in->pts, in->repeat_pict,
-+               !!(in->flags & AV_FRAME_FLAG_TOP_FIELD_FIRST),
-+               !!(in->flags & AV_FRAME_FLAG_INTERLACED));
-+
-+    // RFF / soft-pulldown expansion. We hold one frame back so we can measure its
-+    // real display span (next.pts - this.pts) and tile it onto the field grid:
-+    // span ~= exp_base -> 1 feed (hard telecine / 30p, unchanged); a 3-field frame
-+    // (span ~= 1.5*exp_base) feeds an extra copy across the 2:3 cadence, rebuilding
-+    // the ~30p stream that the matcher + 5:4 decimation invert to a clean 23.976.
-+    if (ctx->exp_pending) {
-+        AVFrame *last;
-+        int64_t span = (in->pts != AV_NOPTS_VALUE &&
-+                        ctx->exp_pending->pts != AV_NOPTS_VALUE)
-+                       ? in->pts - ctx->exp_pending->pts : ctx->exp_base;
-+        if (span < ctx->exp_base)
-+            span = ctx->exp_base;   // a frame always occupies >= one field-frame
-+        ctx->exp_acc += span;
-+        for (n = 0; ctx->exp_acc >= ctx->exp_base; n++)
-+            ctx->exp_acc -= ctx->exp_base;
-+        for (; n > 1; n--) {        // extra display copies (n>=1 always)
-+            AVFrame *copy = av_frame_clone(ctx->exp_pending);
-+            if (!copy)
-+                return AVERROR(ENOMEM);
-+            if ((err = ivtc_feed(avctx, copy)) < 0)
-+                return err;
-+        }
-+        last = ctx->exp_pending;    // last copy hands over the original
-+        ctx->exp_pending = NULL;
-+        if ((err = ivtc_feed(avctx, last)) < 0)
-+            return err;
-+    }
-+    ctx->exp_pending = in;
-+    return 0;
-+}
-+
-+static int activate(AVFilterContext *avctx)
-+{
-+    IvtcOpenCLContext *ctx = avctx->priv;
-+    AVFilterLink *inlink  = avctx->inputs[0];
-+    AVFilterLink *outlink = avctx->outputs[0];
-+    AVFrame *frame = NULL;
-+    int ret = 0, status;
-+    int64_t pts;
-+
-+    FF_FILTER_FORWARD_STATUS_BACK_ALL(outlink, avctx);
-+
-+    if (!ctx->eof && (ret = ff_inlink_consume_frame(inlink, &frame)) > 0) {
-+        ret = ivtc_filter_frame(inlink, frame);
-+        if (ret < 0)
-+            return ret;
-+    }
-+    if (ret < 0)
-+        return ret;
-+
-+    if (!ctx->eof && ff_inlink_acknowledge_status(inlink, &status, &pts)) {
-+        if (status == AVERROR_EOF) {
-+            ctx->eof = 1;
-+            ivtc_drain(avctx);
-+            ff_outlink_set_status(outlink, AVERROR_EOF, pts);
-+            return 0;
-+        }
-+    }
-+
-+    if (ff_inlink_queued_frames(inlink) > 0)
-+        ff_filter_set_ready(avctx, 100);
-+    else if (ff_outlink_frame_wanted(outlink))
-+        ff_inlink_request_frame(inlink);
-+
-+    return 0;
-+}
 +
 +static int ivtc_config_input(AVFilterLink *inlink)
 +{
@@ -833,9 +419,6 @@ libavfilter/opencl_source.h.
 +static int ivtc_config_output(AVFilterLink *outlink)
 +{
 +    AVFilterContext *avctx = outlink->src;
-+    AVFilterLink    *inlink = avctx->inputs[0];
-+    FilterLink         *inl = ff_filter_link(inlink);
-+    FilterLink         *outl = ff_filter_link(outlink);
 +    IvtcOpenCLContext *ctx = avctx->priv;
 +    int ret;
 +
@@ -870,44 +453,21 @@ libavfilter/opencl_source.h.
 +        }
 +    }
 +
-+    // vf_decimate-style timebase: derive the output rate from the input
-+    // frame_rate and the cycle:drop ratio (never hardcode it). The output
-+    // timebase is the decimated frame period, so one unit == one output frame.
-+    if (!inl->frame_rate.num || !inl->frame_rate.den) {
-+        av_log(avctx, AV_LOG_ERROR, "ivtc_opencl needs a constant input frame "
-+               "rate; current %d/%d is invalid.\n",
-+               inl->frame_rate.num, inl->frame_rate.den);
-+        return AVERROR(EINVAL);
-+    }
-+    ctx->in_tb  = inlink->time_base;
-+    ctx->dec_tb = av_mul_q(av_inv_q(inl->frame_rate),
-+                           (AVRational){ IVTC_CYCLE, IVTC_CYCLE - 1 });
-+    outlink->time_base = ctx->dec_tb;
-+    // one display-frame interval at the nominal input rate (e.g. 3003 @ 29.97/90k):
-+    // the quantum the RFF-expander tiles input frames onto by their real PTS span.
-+    ctx->exp_base = av_rescale_q(1, av_inv_q(inl->frame_rate), ctx->in_tb);
-+    if (ctx->exp_base < 1)
-+        ctx->exp_base = 1;
-+    ctx->exp_acc = 0;
-+    outl->frame_rate   = av_inv_q(ctx->dec_tb);
-+
-+    // vf_decimate-style thresholds. The kernel works in normalized floats (0..1),
-+    // so the per-bit-depth max_value cancels: dupthresh is a fraction of a 32x32
-+    // window (2x2 work-group blocks), scthresh a fraction of the whole luma plane.
-+    ctx->dupthresh = (double)(2 * IVTC_WG) * (2 * IVTC_WG) * ctx->dupthresh_flt / 100.0;
-+    ctx->scthresh  = (double)ctx->ocf.output_width * ctx->ocf.output_height *
-+                     ctx->scthresh_flt / 100.0;
-+    av_log(avctx, AV_LOG_VERBOSE, "ivtc_opencl: in fps %d/%d tb %d/%d -> out fps %d/%d\n",
-+           inl->frame_rate.num, inl->frame_rate.den, ctx->in_tb.num, ctx->in_tb.den,
-+           outl->frame_rate.num, outl->frame_rate.den);
-+    return 0;
++    return ff_ivtc_config_output_common(outlink);
 +}
 +
 +static int ivtc_init(AVFilterContext *avctx)
 +{
 +    IvtcOpenCLContext *ctx = avctx->priv;
++    IVTCContext *s = &ctx->ivtc;
++
 +    ctx->ocf.output_format = AV_PIX_FMT_NONE;
-+    ctx->start_pts = AV_NOPTS_VALUE;
++    ff_ivtc_init_common(avctx);
++    s->init        = ivtc_init_cl;
++    s->match_accum = ivtc_cl_match_accum;
++    s->synth       = ivtc_cl_synth;
++    s->diff_cycle  = ivtc_cl_diff_cycle;
++    s->sync        = ivtc_cl_sync;
 +    return 0;
 +}
 +
@@ -917,14 +477,7 @@ libavfilter/opencl_source.h.
 +    cl_int cle;
 +    int i;
 +
-+    ivtc_sync_release(ctx);   // GPU must be idle before frames/CL objects go away
-+    av_frame_free(&ctx->prev);
-+    av_frame_free(&ctx->cur);
-+    av_frame_free(&ctx->next);
-+    av_frame_free(&ctx->dec_prev);
-+    av_frame_free(&ctx->exp_pending);
-+    for (i = 0; i < IVTC_CYCLE; i++)
-+        av_frame_free(&ctx->cyc[i]);
++    ff_ivtc_uninit_common(avctx);
 +
 +    av_freep(&ctx->diff_host);
 +    av_freep(&ctx->cmp_host);
@@ -945,23 +498,11 @@ libavfilter/opencl_source.h.
 +            av_log(avctx, AV_LOG_ERROR, "Failed to release command queue: %d.\n", cle);
 +    }
 +
-+    av_log(avctx, AV_LOG_INFO,
-+           "ivtc_opencl summary: in=%"PRIu64" out=%"PRIu64" (match C=%"PRIu64
-+           " P=%"PRIu64" N=%"PRIu64").\n",
-+           ctx->in_count, ctx->out_count, ctx->match_c, ctx->match_p, ctx->match_n);
-+
 +    ff_opencl_filter_uninit2(avctx, &ctx->ocf);
 +}
 +
-+#define OFFSET(x) offsetof(IvtcOpenCLContext, x)
-+#define FLAGS (AV_OPT_FLAG_VIDEO_PARAM | AV_OPT_FLAG_FILTERING_PARAM)
-+
 +static const AVOption ivtc_opencl_options[] = {
-+    { "tff", "field order (-1 auto, 0 bff, 1 tff)", OFFSET(tff_opt), AV_OPT_TYPE_INT, { .i64 = -1 }, -1, 1, FLAGS },
-+    { "cthresh", "combing tolerance (8-bit units)", OFFSET(cthresh), AV_OPT_TYPE_FLOAT, { .dbl = 9.0 }, 0, 255, FLAGS },
-+    { "dupthresh", "decimation duplicate threshold", OFFSET(dupthresh_flt), AV_OPT_TYPE_DOUBLE, { .dbl = 1.1 }, 0, 100, FLAGS },
-+    { "scthresh", "decimation scene-change threshold", OFFSET(scthresh_flt), AV_OPT_TYPE_DOUBLE, { .dbl = 15.0 }, 0, 100, FLAGS },
-+    { "verbose", "log per-frame pulldown flags", OFFSET(verbose), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, FLAGS },
++    IVTC_COMMON_OPTIONS
 +    { NULL }
 +};
 +
@@ -990,7 +531,7 @@ libavfilter/opencl_source.h.
 +    .priv_class     = &ivtc_opencl_class,
 +    .init           = &ivtc_init,
 +    .uninit         = &ivtc_uninit,
-+    .activate       = &activate,
++    .activate       = &ff_ivtc_activate,
 +    FILTER_INPUTS(ivtc_opencl_inputs),
 +    FILTER_OUTPUTS(ivtc_opencl_outputs),
 +    FILTER_SINGLE_PIXFMT(AV_PIX_FMT_OPENCL),
@@ -1337,11 +878,12 @@ libavfilter/opencl_source.h.
  extern const AVFilter ff_vf_lagfun;
 --- a/libavfilter/Makefile
 +++ b/libavfilter/Makefile
-@@ -365,6 +365,7 @@ OBJS-$(CONFIG_IL_FILTER)
+@@ -365,6 +365,8 @@ OBJS-$(CONFIG_IL_FILTER)
  OBJS-$(CONFIG_INFLATE_FILTER)                += vf_neighbor.o
  OBJS-$(CONFIG_INTERLACE_FILTER)              += vf_tinterlace.o
  OBJS-$(CONFIG_INTERLEAVE_FILTER)             += f_interleave.o
-+OBJS-$(CONFIG_IVTC_OPENCL_FILTER)            += vf_ivtc_opencl.o opencl.o opencl/ivtc.o
++OBJS-$(CONFIG_IVTC_OPENCL_FILTER)            += vf_ivtc_opencl.o opencl.o opencl/ivtc.o \
++                                                ivtc_common.o
  OBJS-$(CONFIG_KERNDEINT_FILTER)              += vf_kerndeint.o
  OBJS-$(CONFIG_KIRSCH_FILTER)                 += vf_convolution.o
  OBJS-$(CONFIG_LAGFUN_FILTER)                 += vf_lagfun.o
@@ -1365,3 +907,674 @@ libavfilter/opencl_source.h.
  extern const char *ff_source_neighbor_cl;
  extern const char *ff_source_nlmeans_cl;
  extern const char *ff_source_overlay_cl;
+--- /dev/null
++++ b/libavfilter/ivtc.h
+@@ -0,0 +1,141 @@
++/*
++ * Copyright (c) 2026
++ *
++ * The inverse-telecine field-matching algorithm is ported from QSVEnc
++ * (QSVPipeline/rgy_filter_ivtc) by rigaya, used under the MIT License:
++ *     QSVEnc/NVEnc/VCEEnc, Copyright (c) 2014-2016 rigaya.
++ *     https://github.com/rigaya/QSVEnc
++ *
++ * This file is part of FFmpeg.
++ *
++ * FFmpeg is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * FFmpeg is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with FFmpeg; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++/*
++ * Backend-agnostic core of the hardware inverse-telecine filters
++ * (ivtc_opencl, ivtc_cuda), in the style of yadif_common.c: the field-match
++ * decision, 5-frame decimation cycle, soft-pulldown (RFF) expansion and emit
++ * timing live in ivtc_common.c; each backend embeds IVTCContext as the first
++ * member of its private context and supplies the GPU hooks below.
++ */
++
++#ifndef AVFILTER_IVTC_H
++#define AVFILTER_IVTC_H
++
++#include <stdint.h>
++
++#include "libavutil/frame.h"
++#include "libavutil/opt.h"
++#include "avfilter.h"
++
++#define IVTC_WG 16             // block (work-group) edge; maxbdiff windows are 2x2 blocks
++#define IVTC_CYCLE 5
++#define IVTC_INFLIGHT_MAX 12   // refs held between blocking reads (3 per synth)
++
++typedef struct IVTCContext {
++    const AVClass *class;
++
++    // options
++    int     tff_opt;              // -1 auto, 0 BFF, 1 TFF
++    float   cthresh;              // combing tolerance (8-bit units)
++    double  dupthresh_flt;        // duplicate threshold (% of block max), like vf_decimate
++    double  scthresh_flt;         // scene-change threshold (% of frame max)
++    int     verbose;
++
++    /*
++     * Backend hooks. match_accum and diff_cycle end with a blocking sync on the
++     * backend's in-order queue/stream (the common code then drops the in-flight
++     * refs); synth only enqueues. sync must be safe before init has run.
++     */
++    // one-time GPU init, run lazily on the first matched frame
++    int  (*init)(AVFilterContext *avctx);
++    // compare_fields accumulators {c,m,ml} of match1 = C (A) and match2 = P (B)
++    int  (*match_accum)(AVFilterContext *avctx, AVFrame *prev, AVFrame *cur,
++                        AVFrame *next, int tff, double A[3], double B[3]);
++    // weave the chosen match (0=C,1=P,2=N,3=B,4=U) into dst, all planes
++    int  (*synth)(AVFilterContext *avctx, AVFrame *dst, AVFrame *prev,
++                  AVFrame *cur, AVFrame *next, int tff, int match);
++    // per-block luma diff of a[i] vs b[i] (skipped where b[i] is NULL); on
++    // return *sums holds IVTC_CYCLE slices of nwg block sums, *stride apart
++    int  (*diff_cycle)(AVFilterContext *avctx, AVFrame *const a[IVTC_CYCLE],
++                       AVFrame *const b[IVTC_CYCLE], const float **sums, int *stride);
++    // wait for all enqueued GPU work
++    void (*sync)(AVFilterContext *avctx);
++
++    int       initialised;
++    int       luma_w, luma_h, luma_hf;  // luma_hf = luma_h/2 (borrowed field rows)
++    int       nwg, nwgx, nwgy;          // IVTC_WG block grid over the luma plane
++
++    // frames still referenced by enqueued, not yet synchronised GPU work
++    AVFrame  *inflight[IVTC_INFLIGHT_MAX];
++    int       n_inflight;
++
++    // decimation thresholds, derived in config_output (normalized-float units)
++    double  dupthresh;            // max_bdiff below this => frame is a duplicate
++    double  scthresh;             // tot_diff above this  => scene change
++
++    // 3-frame match window (input refs)
++    AVFrame *prev, *cur, *next;
++
++    // decimation cycle of matched frames + cross-cycle predecessor
++    AVFrame *cyc[IVTC_CYCLE];
++    int      ncyc;
++    AVFrame *dec_prev;           // last emitted matched frame (ref)
++
++    // emit timing -- mirrors vf_decimate: output timebase/rate derived from the
++    // input frame_rate, output pts anchored to the first kept frame's real pts.
++    AVRational in_tb;            // input time_base
++    AVRational dec_tb;           // output (decimated) frame period = (1/fps)*cycle/(cycle-1)
++    int64_t  start_pts;          // first kept frame's pts, rescaled to dec_tb
++    int64_t  last_pts;           // last emitted pts (dec_tb units)
++    int64_t  last_duration;      // last emitted duration (dec_tb units)
++
++    // soft-pulldown (RFF) expansion: qsv strips repeat_pict, but the 2:3 cadence
++    // survives in the inter-frame PTS spans. Re-materialise each frame onto the
++    // display-field grid so soft telecine (24p, spans 2,3,2,3 fields) becomes a
++    // uniform field-rate stream the matcher + 5:4 decimation invert exactly. Hard
++    // telecine / true 30p have uniform spans == exp_base => exactly one feed.
++    int64_t  exp_base;           // one display-frame interval, in in_tb units
++    int64_t  exp_acc;            // accumulated span not yet emitted to the grid
++    AVFrame *exp_pending;        // buffered input frame awaiting its span
++
++    int      eof;
++    uint64_t in_count, out_count, match_c, match_p, match_n;
++} IVTCContext;
++
++#define IVTC_OFFSET(x) offsetof(IVTCContext, x)
++#define IVTC_FLAGS (AV_OPT_FLAG_VIDEO_PARAM | AV_OPT_FLAG_FILTERING_PARAM)
++
++// Shared option table entries; IVTCContext must be the first member.
++#define IVTC_COMMON_OPTIONS \
++    { "tff", "field order (-1 auto, 0 bff, 1 tff)", IVTC_OFFSET(tff_opt), AV_OPT_TYPE_INT, { .i64 = -1 }, -1, 1, IVTC_FLAGS }, \
++    { "cthresh", "combing tolerance (8-bit units)", IVTC_OFFSET(cthresh), AV_OPT_TYPE_FLOAT, { .dbl = 9.0 }, 0, 255, IVTC_FLAGS }, \
++    { "dupthresh", "decimation duplicate threshold", IVTC_OFFSET(dupthresh_flt), AV_OPT_TYPE_DOUBLE, { .dbl = 1.1 }, 0, 100, IVTC_FLAGS }, \
++    { "scthresh", "decimation scene-change threshold", IVTC_OFFSET(scthresh_flt), AV_OPT_TYPE_DOUBLE, { .dbl = 15.0 }, 0, 100, IVTC_FLAGS }, \
++    { "verbose", "log per-frame pulldown flags", IVTC_OFFSET(verbose), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, IVTC_FLAGS },
++
++void ff_ivtc_init_common(AVFilterContext *avctx);
++
++// Timebase, frame rate, RFF quantum, block grid and decimation thresholds.
++// Call after the backend has set outlink->w/h.
++int ff_ivtc_config_output_common(AVFilterLink *outlink);
++
++int ff_ivtc_activate(AVFilterContext *avctx);
++
++// Sync the GPU and free every held frame, then log the summary. The backend
++// releases its own GPU objects afterwards.
++void ff_ivtc_uninit_common(AVFilterContext *avctx);
++
++#endif /* AVFILTER_IVTC_H */
+--- /dev/null
++++ b/libavfilter/ivtc_common.c
+@@ -0,0 +1,524 @@
++/*
++ * Copyright (c) 2026
++ *
++ * The inverse-telecine field-matching algorithm is ported from QSVEnc
++ * (QSVPipeline/rgy_filter_ivtc) by rigaya, used under the MIT License:
++ *     QSVEnc/NVEnc/VCEEnc, Copyright (c) 2014-2016 rigaya.
++ *     https://github.com/rigaya/QSVEnc
++ *
++ * This file is part of FFmpeg.
++ *
++ * FFmpeg is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * FFmpeg is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with FFmpeg; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++/*
++ * Shared inverse-telecine core. For each input frame the backend scores the
++ * C/P field-match candidates on the GPU (vf_fieldmatch compare_fields
++ * accumulators); the decision runs here. The matched frame is synthesized by
++ * the backend, matched frames are accumulated into a 5-frame cycle and the
++ * most-redundant one is dropped (vf_decimate's maxbdiff metric), yielding
++ * 23.976 CFR from 29.97 telecine.
++ */
++
++#include <inttypes.h>
++#include <float.h>
++
++#include "libavutil/common.h"
++#include "libavutil/mathematics.h"
++
++#include "filters.h"
++#include "ivtc.h"
++#include "video.h"
++
++// ---- small helpers -------------------------------------------------------
++
++// Drop the frame refs held for in-flight GPU work. Only call right after a
++// blocking read / full sync on the (in-order) queue.
++static void ivtc_release_inflight(IVTCContext *s)
++{
++    while (s->n_inflight > 0)
++        av_frame_free(&s->inflight[--s->n_inflight]);
++}
++
++// Full sync + release (explicit paths: error, flush, uninit).
++static void ivtc_sync_release(AVFilterContext *avctx)
++{
++    IVTCContext *s = avctx->priv;
++    if (s->sync)
++        s->sync(avctx);
++    ivtc_release_inflight(s);
++}
++
++static int ivtc_resolve_tff(IVTCContext *s, const AVFrame *f)
++{
++    if (s->tff_opt >= 0)
++        return s->tff_opt;
++    return (f->flags & AV_FRAME_FLAG_TOP_FIELD_FIRST) ? 1 : 0;
++}
++
++// ---- field match ----------------------------------------------------------
++
++// compare_fields decision (vf_fieldmatch.c:586-608). a = match1 accumulators
++// {c,m,ml}, b = match2. Returns 1 if match2 wins, 0 if match1.
++static int ivtc_decide(const double a[3], const double b[3])
++{
++    double Am = a[1], Bm = b[1], Aml = a[2], Bml = b[2];
++    int norm1, norm2, mtn1, mtn2;
++    double c1, c2, mr;
++
++    if (Am < 500 && Bm < 500 && (Aml >= 500 || Bml >= 500) &&
++        FFMAX(Aml, Bml) > 3 * FFMIN(Aml, Bml)) { Am = Aml; Bm = Bml; }
++    norm1 = (int)(a[0] / 6.0 + 0.5); norm2 = (int)(b[0] / 6.0 + 0.5);
++    mtn1  = (int)(Am   / 6.0 + 0.5); mtn2  = (int)(Bm   / 6.0 + 0.5);
++    c1 = (double)FFMAX(norm1, norm2) / FFMAX(FFMIN(norm1, norm2), 1);
++    c2 = (double)FFMAX(mtn1,  mtn2)  / FFMAX(FFMIN(mtn1,  mtn2),  1);
++    mr = (double)FFMAX(mtn1,  mtn2)  / FFMAX(FFMAX(norm1, norm2), 1);
++    if (((mtn1 >=  500 || mtn2 >=  500) && (mtn1*2 < mtn2   || mtn2*2 < mtn1))   ||
++        ((mtn1 >= 1000 || mtn2 >= 1000) && (mtn1*3 < mtn2*2 || mtn2*3 < mtn1*2)) ||
++        ((mtn1 >= 2000 || mtn2 >= 2000) && (mtn1*5 < mtn2*4 || mtn2*5 < mtn1*4)) ||
++        ((mtn1 >= 4000 || mtn2 >= 4000) && c2 > c1))
++        return mtn1 > mtn2 ? 1 : 0;
++    else if (mr > 0.005 && FFMAX(mtn1, mtn2) > 150 && (mtn1*2 < mtn2 || mtn2*2 < mtn1))
++        return mtn1 > mtn2 ? 1 : 0;
++    else
++        return norm1 > norm2 ? 1 : 0;
++}
++
++// Field-match via vf_fieldmatch compare_fields (Stage 1: C vs P primary, default
++// mode pc_n). The backend computes the motion-mask + masked combing accumulators
++// on the GPU with one readback; the scalar decision runs here. Returns match
++// 0=C, 1=P. (next reserved for the scene-change / mN fallback added in Stage 2.)
++static int ivtc_pick_match(AVFilterContext *avctx, AVFrame *prev, AVFrame *cur,
++                           AVFrame *next, int tff, int *out_match)
++{
++    IVTCContext *s = avctx->priv;
++    double A[3] = { 0, 0, 0 }, B[3] = { 0, 0, 0 };
++    int err, m;
++
++    if ((err = s->match_accum(avctx, prev, cur, next, tff, A, B)) < 0)
++        return err;
++    // blocking read on the in-order queue: all earlier work (incl. prior synths) is done
++    ivtc_release_inflight(s);
++
++    m = ivtc_decide(A, B);   // 0 = C (match1), 1 = P (match2)
++    *out_match = m;
++    av_log(avctx, AV_LOG_DEBUG, "ivtc match: C(c=%.0f m=%.0f) P(c=%.0f m=%.0f) -> %c\n",
++           A[0], A[1], B[0], B[1], "CP"[m]);
++    return 0;
++}
++
++// Synthesize the chosen match into dst (all planes).
++static int ivtc_synth(AVFilterContext *avctx, AVFrame *dst, AVFrame *prev,
++                      AVFrame *cur, AVFrame *next, int tff, int match)
++{
++    IVTCContext *s = avctx->priv;
++    AVFrame *const refs[3] = { prev, cur, next };
++    int err, i;
++
++    // make room: if a caller ever queues more synths than fit, sync first
++    if (s->n_inflight + 3 > IVTC_INFLIGHT_MAX)
++        ivtc_sync_release(avctx);
++
++    if ((err = s->synth(avctx, dst, prev, cur, next, tff, match)) < 0)
++        return err;
++
++    // No sync: hold refs on the input frames until the next blocking read so
++    // their buffers cannot return to the upstream pool while the GPU still reads them.
++    for (i = 0; i < 3; i++) {
++        s->inflight[s->n_inflight] = av_frame_clone(refs[i]);
++        if (!s->inflight[s->n_inflight])
++            return AVERROR(ENOMEM);
++        s->n_inflight++;
++    }
++    return 0;
++}
++
++// ---- decimation metrics ---------------------------------------------------
++
++// Per-block luma diff between two matched frames, reduced to vf_decimate's two
++// metrics. The backend's diff kernel already emits one abs-diff sum per 16x16
++// block laid out as nwgy rows x nwgx cols; here we only reduce that small grid
++// on the host -- the per-pixel work stayed on the GPU.
++//   totdiff  = sum of all blocks                  (global; scene-change signal)
++//   maxbdiff = max over overlapping 2x2-block (32x32 px) windows  (localized)
++// Ranking duplicates by maxbdiff -- not the global sum -- is what makes limited-
++// animation frames (small moving region, low global sum, high local diff) lose
++// to the true woven duplicate (low diff everywhere), matching vf_decimate.
++static void ivtc_diff_metrics(IVTCContext *s, const float *dh,
++                              double *maxbdiff, double *totdiff)
++{
++    int i, j;
++    double tot = 0.0, mx = -1.0;
++
++    for (i = 0; i < s->nwg; i++)
++        tot += dh[i];
++    for (i = 0; i < s->nwgy - 1; i++) {
++        for (j = 0; j < s->nwgx - 1; j++) {
++            double t = (double)dh[ i      * s->nwgx + j    ]
++                     + (double)dh[ i      * s->nwgx + j + 1]
++                     + (double)dh[(i + 1) * s->nwgx + j    ]
++                     + (double)dh[(i + 1) * s->nwgx + j + 1];
++            if (t > mx)
++                mx = t;
++        }
++    }
++    *totdiff  = tot;
++    *maxbdiff = mx < 0.0 ? tot : mx;   // grids smaller than 2x2 fall back to total
++}
++
++// ---- emit + decimation ----------------------------------------------------
++
++// Emit a kept frame, stamping its output PTS from the input frame's own PTS
++// rescaled to the decimated output timebase (then forced strictly increasing).
++// On clean telecine the 4 kept frames of each 5-cycle rescale onto consecutive
++// output slots == a uniform 23.976 grid (smooth, same as vf_decimate). When the
++// input under-delivers (decode/PCR gaps), that gap carries straight through to
++// the output PTS, so the downstream CFR encoder fills it with a SINGLE, spread
++// duplicate at the gap -- exactly like vpp_deinterlace's 1:1 passthrough --
++// instead of the old free-running-grid + drift-guard which accumulated drift and
++// then jumped, bunching the compensation into visible dup bursts ("reduced
++// frames"). The PTS still tracks the input timeline, so A/V cannot drift.
++static int ivtc_emit(AVFilterContext *avctx, AVFrame *frame)
++{
++    IVTCContext *s = avctx->priv;
++    AVFilterLink *outlink = avctx->outputs[0];
++    int64_t in_pts = frame->pts;   // matched frame's real input pts (in_tb)
++    int64_t want;
++
++    // Emit a contiguous 23.976 grid: anchor the first kept frame to the input's
++    // real pts (A/V alignment), then free-run +1 per kept frame. We do NOT track
++    // input pts per frame -- on soft pulldown its 2:3 cadence is non-uniform, and
++    // carrying that through would leave holes the CFR/HLS muxer dup-fills (the
++    // judder). RFF expansion above keeps the kept-frame count matched to the
++    // content duration, so a contiguous grid stays A/V-synced.
++    if (s->out_count == 0)
++        want = (in_pts != AV_NOPTS_VALUE) ? av_rescale_q(in_pts, s->in_tb, s->dec_tb)
++                                          : 0;
++    else
++        want = s->last_pts + 1;
++
++    frame->pts      = want;
++    frame->duration = 1;
++    s->last_pts     = want;
++    s->out_count++;
++    return ff_filter_frame(outlink, frame);
++}
++
++// Drop one frame of the full cycle, emit the other four. Selection mirrors
++// vf_decimate::filter_frame: drop the lowest-maxbdiff frame (the duplicate); if
++// the cycle has no frame below dupthresh but does contain a scene change, drop
++// the scene-change frame instead of a real unique one.
++static int ivtc_decimate(AVFilterContext *avctx)
++{
++    IVTCContext *s = avctx->priv;
++    double maxbdiff[IVTC_CYCLE], totdiff[IVTC_CYCLE];
++    AVFrame *pred[IVTC_CYCLE];
++    const float *sums = NULL;
++    int stride = 0;
++    int scpos = -1, duppos = -1, drop, lowest = 0, i, err;
++
++    // metric of each frame vs its temporal predecessor; cyc[0]'s predecessor is
++    // the previous cycle's last frame (dec_prev), exactly like decimate's dm->last.
++    // All diff launches are enqueued first (one slice each), then ONE blocking read.
++    for (i = 0; i < IVTC_CYCLE; i++)
++        pred[i] = i ? s->cyc[i - 1] : s->dec_prev;
++    if ((err = s->diff_cycle(avctx, s->cyc, pred, &sums, &stride)) < 0)
++        return err;
++    ivtc_release_inflight(s);
++    for (i = 0; i < IVTC_CYCLE; i++) {
++        if (!pred[i])
++            maxbdiff[i] = totdiff[i] = DBL_MAX;
++        else
++            ivtc_diff_metrics(s, sums + (size_t)i * stride, &maxbdiff[i], &totdiff[i]);
++    }
++
++    for (i = 0; i < IVTC_CYCLE; i++) {
++        if (totdiff[i] > s->scthresh)
++            scpos = i;
++        if (maxbdiff[i] < maxbdiff[lowest])
++            lowest = i;
++    }
++    if (maxbdiff[lowest] < s->dupthresh)
++        duppos = lowest;
++    drop = (scpos >= 0 && duppos < 0) ? scpos : lowest;
++
++    if (av_log_get_level() >= AV_LOG_DEBUG) {
++        av_log(avctx, AV_LOG_DEBUG, "ivtc 1/%d drop:\n", IVTC_CYCLE);
++        for (i = 0; i < IVTC_CYCLE; i++)
++            av_log(avctx, AV_LOG_DEBUG, "  #%d maxbdiff=%.1f totdiff=%.1f%s%s%s%s\n",
++                   i, maxbdiff[i], totdiff[i],
++                   i == scpos ? " sc" : "", i == duppos ? " dup" : "",
++                   i == lowest ? " lowest" : "", i == drop ? " [DROP]" : "");
++    }
++
++    // predecessor for next cycle's frame 0 = this cycle's last frame (decimate's
++    // dm->last is cloned from the cycle's final frame regardless of the drop).
++    av_frame_free(&s->dec_prev);
++    s->dec_prev = av_frame_clone(s->cyc[IVTC_CYCLE - 1]);
++
++    for (i = 0; i < IVTC_CYCLE; i++) {
++        if (i == drop) {
++            av_frame_free(&s->cyc[i]);
++        } else {
++            err = ivtc_emit(avctx, s->cyc[i]);   // takes ownership
++            s->cyc[i] = NULL;
++            if (err < 0)
++                return err;
++        }
++        s->cyc[i] = NULL;
++    }
++    s->ncyc = 0;
++    return 0;
++}
++
++// Field-match `cur` (using prev/next), synthesize, push to the cycle.
++static int ivtc_process(AVFilterContext *avctx, AVFrame *prev, AVFrame *cur, AVFrame *next)
++{
++    IVTCContext *s = avctx->priv;
++    AVFilterLink *outlink = avctx->outputs[0];
++    int tff = ivtc_resolve_tff(s, cur);
++    int match = 0, err;
++    AVFrame *out;
++
++    if (!s->initialised) {
++        if ((err = s->init(avctx)) < 0)
++            return err;
++        s->initialised = 1;
++    }
++
++    if ((err = ivtc_pick_match(avctx, prev, cur, next, tff, &match)) < 0)
++        return err;
++    if (match == 0) s->match_c++; else if (match == 1) s->match_p++; else s->match_n++;
++
++    out = ff_get_video_buffer(outlink, outlink->w, outlink->h);
++    if (!out)
++        return AVERROR(ENOMEM);
++    if ((err = av_frame_copy_props(out, cur)) < 0 ||
++        (err = ivtc_synth(avctx, out, prev, cur, next, tff, match)) < 0) {
++        ivtc_sync_release(avctx);   // partial synth may be queued against `out`
++        av_frame_free(&out);
++        return err;
++    }
++    out->flags &= ~AV_FRAME_FLAG_INTERLACED;
++    out->repeat_pict = 0;
++
++    s->cyc[s->ncyc++] = out;
++    if (s->ncyc >= IVTC_CYCLE)
++        return ivtc_decimate(avctx);
++    return 0;
++}
++
++// ---- filter plumbing ------------------------------------------------------
++
++// Slide the 3-frame match window and process. Takes ownership of `in`.
++static int ivtc_feed(AVFilterContext *avctx, AVFrame *in)
++{
++    IVTCContext *s = avctx->priv;
++    av_frame_free(&s->prev);
++    s->prev = s->cur;
++    s->cur  = s->next;
++    s->next = in;
++    if (!s->cur)
++        return 0;   // need at least cur+next before matching
++    return ivtc_process(avctx, s->prev ? s->prev : s->cur, s->cur, s->next);
++}
++
++static int ivtc_drain(AVFilterContext *avctx)
++{
++    IVTCContext *s = avctx->priv;
++    int err, i;
++
++    // flush the frame held back for span computation before draining the window
++    if (s->exp_pending) {
++        AVFrame *last = s->exp_pending;
++        s->exp_pending = NULL;
++        if ((err = ivtc_feed(avctx, last)) < 0)
++            return err;
++    }
++
++    // Process the final buffered frame (next), aliasing its own next.
++    if (s->next && s->cur) {
++        if ((err = ivtc_process(avctx, s->cur, s->next, s->next)) < 0)
++            return err;
++    }
++    // Flush whatever remains in the cycle without dropping. No diff readback
++    // happens on this path, so sync explicitly before the frames leave.
++    ivtc_sync_release(avctx);
++    for (i = 0; i < s->ncyc; i++) {
++        err = ivtc_emit(avctx, s->cyc[i]);
++        s->cyc[i] = NULL;
++        if (err < 0)
++            return err;
++    }
++    s->ncyc = 0;
++    return 0;
++}
++
++static int ivtc_filter_frame(AVFilterLink *inlink, AVFrame *in)
++{
++    AVFilterContext *avctx = inlink->dst;
++    IVTCContext *s = avctx->priv;
++
++    int err, n;
++
++    s->in_count++;
++    if (s->verbose)
++        av_log(avctx, AV_LOG_VERBOSE,
++               "ivtc IN #%"PRIu64": pts=%"PRId64" repeat_pict=%d TFF=%d INTERLACED=%d\n",
++               s->in_count - 1, in->pts, in->repeat_pict,
++               !!(in->flags & AV_FRAME_FLAG_TOP_FIELD_FIRST),
++               !!(in->flags & AV_FRAME_FLAG_INTERLACED));
++
++    // RFF / soft-pulldown expansion. We hold one frame back so we can measure its
++    // real display span (next.pts - this.pts) and tile it onto the field grid:
++    // span ~= exp_base -> 1 feed (hard telecine / 30p, unchanged); a 3-field frame
++    // (span ~= 1.5*exp_base) feeds an extra copy across the 2:3 cadence, rebuilding
++    // the ~30p stream that the matcher + 5:4 decimation invert to a clean 23.976.
++    if (s->exp_pending) {
++        AVFrame *last;
++        int64_t span = (in->pts != AV_NOPTS_VALUE &&
++                        s->exp_pending->pts != AV_NOPTS_VALUE)
++                       ? in->pts - s->exp_pending->pts : s->exp_base;
++        if (span < s->exp_base)
++            span = s->exp_base;   // a frame always occupies >= one field-frame
++        s->exp_acc += span;
++        for (n = 0; s->exp_acc >= s->exp_base; n++)
++            s->exp_acc -= s->exp_base;
++        for (; n > 1; n--) {        // extra display copies (n>=1 always)
++            AVFrame *copy = av_frame_clone(s->exp_pending);
++            if (!copy)
++                return AVERROR(ENOMEM);
++            if ((err = ivtc_feed(avctx, copy)) < 0)
++                return err;
++        }
++        last = s->exp_pending;    // last copy hands over the original
++        s->exp_pending = NULL;
++        if ((err = ivtc_feed(avctx, last)) < 0)
++            return err;
++    }
++    s->exp_pending = in;
++    return 0;
++}
++
++int ff_ivtc_activate(AVFilterContext *avctx)
++{
++    IVTCContext *s = avctx->priv;
++    AVFilterLink *inlink  = avctx->inputs[0];
++    AVFilterLink *outlink = avctx->outputs[0];
++    AVFrame *frame = NULL;
++    int ret = 0, status;
++    int64_t pts;
++
++    FF_FILTER_FORWARD_STATUS_BACK_ALL(outlink, avctx);
++
++    if (!s->eof && (ret = ff_inlink_consume_frame(inlink, &frame)) > 0) {
++        ret = ivtc_filter_frame(inlink, frame);
++        if (ret < 0)
++            return ret;
++    }
++    if (ret < 0)
++        return ret;
++
++    if (!s->eof && ff_inlink_acknowledge_status(inlink, &status, &pts)) {
++        if (status == AVERROR_EOF) {
++            s->eof = 1;
++            ivtc_drain(avctx);
++            ff_outlink_set_status(outlink, AVERROR_EOF, pts);
++            return 0;
++        }
++    }
++
++    if (ff_inlink_queued_frames(inlink) > 0)
++        ff_filter_set_ready(avctx, 100);
++    else if (ff_outlink_frame_wanted(outlink))
++        ff_inlink_request_frame(inlink);
++
++    return 0;
++}
++
++int ff_ivtc_config_output_common(AVFilterLink *outlink)
++{
++    AVFilterContext *avctx = outlink->src;
++    AVFilterLink    *inlink = avctx->inputs[0];
++    FilterLink         *inl = ff_filter_link(inlink);
++    FilterLink         *outl = ff_filter_link(outlink);
++    IVTCContext *s = avctx->priv;
++
++    // luma block grid the GPU reductions run over
++    s->luma_w  = outlink->w;
++    s->luma_h  = outlink->h;
++    s->luma_hf = s->luma_h / 2;
++    s->nwgx = (s->luma_w + IVTC_WG - 1) / IVTC_WG;
++    s->nwgy = (s->luma_h + IVTC_WG - 1) / IVTC_WG;
++    s->nwg  = s->nwgx * s->nwgy;
++
++    // vf_decimate-style timebase: derive the output rate from the input
++    // frame_rate and the cycle:drop ratio (never hardcode it). The output
++    // timebase is the decimated frame period, so one unit == one output frame.
++    if (!inl->frame_rate.num || !inl->frame_rate.den) {
++        av_log(avctx, AV_LOG_ERROR, "%s needs a constant input frame "
++               "rate; current %d/%d is invalid.\n", avctx->filter->name,
++               inl->frame_rate.num, inl->frame_rate.den);
++        return AVERROR(EINVAL);
++    }
++    s->in_tb  = inlink->time_base;
++    s->dec_tb = av_mul_q(av_inv_q(inl->frame_rate),
++                         (AVRational){ IVTC_CYCLE, IVTC_CYCLE - 1 });
++    outlink->time_base = s->dec_tb;
++    // one display-frame interval at the nominal input rate (e.g. 3003 @ 29.97/90k):
++    // the quantum the RFF-expander tiles input frames onto by their real PTS span.
++    s->exp_base = av_rescale_q(1, av_inv_q(inl->frame_rate), s->in_tb);
++    if (s->exp_base < 1)
++        s->exp_base = 1;
++    s->exp_acc = 0;
++    outl->frame_rate   = av_inv_q(s->dec_tb);
++
++    // vf_decimate-style thresholds. The kernels work in normalized floats (0..1),
++    // so the per-bit-depth max_value cancels: dupthresh is a fraction of a 32x32
++    // window (2x2 blocks), scthresh a fraction of the whole luma plane.
++    s->dupthresh = (double)(2 * IVTC_WG) * (2 * IVTC_WG) * s->dupthresh_flt / 100.0;
++    s->scthresh  = (double)outlink->w * outlink->h * s->scthresh_flt / 100.0;
++    av_log(avctx, AV_LOG_VERBOSE, "%s: in fps %d/%d tb %d/%d -> out fps %d/%d\n",
++           avctx->filter->name,
++           inl->frame_rate.num, inl->frame_rate.den, s->in_tb.num, s->in_tb.den,
++           outl->frame_rate.num, outl->frame_rate.den);
++    return 0;
++}
++
++void ff_ivtc_init_common(AVFilterContext *avctx)
++{
++    IVTCContext *s = avctx->priv;
++    s->start_pts = AV_NOPTS_VALUE;
++}
++
++void ff_ivtc_uninit_common(AVFilterContext *avctx)
++{
++    IVTCContext *s = avctx->priv;
++    int i;
++
++    ivtc_sync_release(avctx);   // GPU must be idle before frames/GPU objects go away
++    av_frame_free(&s->prev);
++    av_frame_free(&s->cur);
++    av_frame_free(&s->next);
++    av_frame_free(&s->dec_prev);
++    av_frame_free(&s->exp_pending);
++    for (i = 0; i < IVTC_CYCLE; i++)
++        av_frame_free(&s->cyc[i]);
++
++    av_log(avctx, AV_LOG_INFO,
++           "%s summary: in=%"PRIu64" out=%"PRIu64" (match C=%"PRIu64
++           " P=%"PRIu64" N=%"PRIu64").\n", avctx->filter->name,
++           s->in_count, s->out_count, s->match_c, s->match_p, s->match_n);
++}
