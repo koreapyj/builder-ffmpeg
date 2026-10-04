@@ -26,13 +26,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Debian bullseye
-          - distro: debian
-            codename: bullseye
-            arch: amd64
-          - distro: debian
-            codename: bullseye
-            arch: arm64
           # Debian bookworm
           - distro: debian
             codename: bookworm
