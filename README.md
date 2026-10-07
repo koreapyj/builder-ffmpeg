@@ -9,7 +9,7 @@ Our patches always layer **on top of** jellyfin's, never under:
   `docker-build.sh` carries them when it executes). These never touch ffmpeg source.
 - [`source-patches/`](source-patches/) — **ffmpeg-source** patches (`libav*/`, `fftools/`).
   Appended to jellyfin's `debian/patches/series`, so `dpkg-source` (Linux) and `quilt push`
-  (Win64) apply them **last**, on top of jellyfin's 94 source patches. Developed/refreshed
+  (Win64) apply them **last**, on top of jellyfin's 100 source patches. Developed/refreshed
   against the real jellyfin-patched ffmpeg, so they can never break a jellyfin patch.
 
 ## Local fast-incremental build (patch development)
@@ -67,7 +67,7 @@ upstream (lean simply filters out the HWA-specific `--enable-*`).
 
 ### Useful variables
 
-`FF_REF` (upstream tag, default `v7.1.4-3`), `FF_REPO`, `CODENAME` / `ARCH`
+`FF_REF` (upstream tag, default `v8.1.3-1`), `FF_REPO`, `CODENAME` / `ARCH`
 (default: same as host), `PROFILE`. Run `make help` for the full list.
 
 `make clean` removes the `./src/` workspace; `make clean-image` removes the

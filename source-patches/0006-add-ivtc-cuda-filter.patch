@@ -45,10 +45,10 @@ compat/cuda/cuda_runtime.h.
  
 --- a/configure
 +++ b/configure
-@@ -3922,6 +3922,8 @@ iccdetect_filter_deps="lcms2"
- iccgen_filter_deps="lcms2"
+@@ -4182,6 +4182,8 @@ iccgen_filter_deps="lcms2"
  identity_filter_select="scene_sad"
  interlace_filter_deps="gpl"
+ interlace_vulkan_filter_deps="vulkan spirv_library"
 +ivtc_cuda_filter_deps="ffnvcodec"
 +ivtc_cuda_filter_deps_any="cuda_nvcc cuda_llvm"
  ivtc_opencl_filter_deps="opencl"
@@ -56,9 +56,9 @@ compat/cuda/cuda_runtime.h.
  ladspa_filter_deps="ladspa libdl"
 --- a/libavfilter/Makefile
 +++ b/libavfilter/Makefile
-@@ -365,6 +365,8 @@ OBJS-$(CONFIG_IL_FILTER)
- OBJS-$(CONFIG_INFLATE_FILTER)                += vf_neighbor.o
+@@ -375,6 +375,8 @@ OBJS-$(CONFIG_INFLATE_FILTER)
  OBJS-$(CONFIG_INTERLACE_FILTER)              += vf_tinterlace.o
+ OBJS-$(CONFIG_INTERLACE_VULKAN_FILTER)       += vf_interlace_vulkan.o vulkan.o vulkan_filter.o
  OBJS-$(CONFIG_INTERLEAVE_FILTER)             += f_interleave.o
 +OBJS-$(CONFIG_IVTC_CUDA_FILTER)              += vf_ivtc_cuda.o vf_ivtc_cuda.ptx.o \
 +                                                ivtc_common.o cuda/load_helper.o
@@ -67,14 +67,14 @@ compat/cuda/cuda_runtime.h.
  OBJS-$(CONFIG_KERNDEINT_FILTER)              += vf_kerndeint.o
 --- a/libavfilter/allfilters.c
 +++ b/libavfilter/allfilters.c
-@@ -336,6 +336,7 @@ extern const AVFilter ff_vf_il;
- extern const AVFilter ff_vf_inflate;
- extern const AVFilter ff_vf_interlace;
- extern const AVFilter ff_vf_interleave;
-+extern const AVFilter ff_vf_ivtc_cuda;
- extern const AVFilter ff_vf_ivtc_opencl;
- extern const AVFilter ff_vf_kerndeint;
- extern const AVFilter ff_vf_kirsch;
+@@ -344,6 +344,7 @@ extern const FFFilter ff_vf_inflate;
+ extern const FFFilter ff_vf_interlace;
+ extern const FFFilter ff_vf_interlace_vulkan;
+ extern const FFFilter ff_vf_interleave;
++extern const FFFilter ff_vf_ivtc_cuda;
+ extern const FFFilter ff_vf_ivtc_opencl;
+ extern const FFFilter ff_vf_kerndeint;
+ extern const FFFilter ff_vf_kirsch;
 --- /dev/null
 +++ b/libavfilter/vf_ivtc_cuda.c
 @@ -0,0 +1,529 @@
@@ -593,18 +593,18 @@ compat/cuda/cuda_runtime.h.
 +    },
 +};
 +
-+const AVFilter ff_vf_ivtc_cuda = {
-+    .name           = "ivtc_cuda",
-+    .description    = NULL_IF_CONFIG_SMALL("Inverse telecine (field matching) through CUDA."),
++const FFFilter ff_vf_ivtc_cuda = {
++    .p.name         = "ivtc_cuda",
++    .p.description  = NULL_IF_CONFIG_SMALL("Inverse telecine (field matching) through CUDA."),
++    .p.priv_class   = &ivtc_cuda_class,
++    .p.flags        = AVFILTER_FLAG_HWDEVICE,
 +    .priv_size      = sizeof(IvtcCUDAContext),
-+    .priv_class     = &ivtc_cuda_class,
 +    .init           = &ivtc_init,
 +    .uninit         = &ivtc_uninit,
 +    .activate       = &ff_ivtc_activate,
 +    FILTER_INPUTS(ivtc_cuda_inputs),
 +    FILTER_OUTPUTS(ivtc_cuda_outputs),
 +    FILTER_SINGLE_PIXFMT(AV_PIX_FMT_CUDA),
-+    .flags          = AVFILTER_FLAG_HWDEVICE,
 +    .flags_internal = FF_FILTER_FLAG_HWFRAME_AWARE,
 +};
 --- /dev/null

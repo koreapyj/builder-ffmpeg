@@ -10,7 +10,7 @@
 
 set -euxo pipefail
 
-# Apply jellyfin's own debian/patches (debian/source/format is "3.0 (quilt)", ~94
+# Apply jellyfin's own debian/patches (debian/source/format is "3.0 (quilt)", ~100
 # hwaccel patches) so the in-tree source matches the packaged build. dpkg-source
 # does this with its built-in quilt support -- no `quilt` binary required -- and is
 # idempotent (a no-op once .pc/ records them as applied).
@@ -36,9 +36,10 @@ rm -f /tmp/_cfg.mk
 # software-codec flags -- including --enable-libaribcaption -- are kept.
 if [ "${PROFILE:-lean}" != "full" ]; then
     LEAN_DROP="--enable-lto=auto --enable-opencl --enable-libdrm --enable-vaapi \
-               --enable-amf --enable-libvpl --enable-vulkan --enable-libplacebo \
-               --enable-libshaderc --enable-ffnvcodec --enable-cuda \
-               --enable-cuda-llvm --enable-cuvid --enable-nvdec --enable-nvenc"
+               --enable-amf --enable-libvpl --enable-vulkan --enable-vulkan-static \
+               --enable-libplacebo --enable-libshaderc --enable-ffnvcodec --enable-cuda \
+               --enable-cuda-llvm --enable-cuvid --enable-nvdec --enable-nvenc \
+               --enable-rkmpp --enable-rkrga"
     filtered=""
     for tok in ${CONFIG}; do
         drop=0

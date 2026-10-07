@@ -1,0 +1,12 @@
+diff --git a/docker-build-win64.sh b/docker-build-win64.sh
+--- a/docker-build-win64.sh
++++ b/docker-build-win64.sh
+@@ -405,7 +405,7 @@
+ 
+ # X265
+ x265_commit="e9b88125dc21393b3fd8d68e98083bdfb89778a8"
+-git clone https://github.com/Multicorewareinc/x265.git
++git clone https://github.com/Multicorewareinc/x265.git x265_git
+ pushd x265_git
+ git checkout ${x265_commit}
+ # Unbreak GCC 15

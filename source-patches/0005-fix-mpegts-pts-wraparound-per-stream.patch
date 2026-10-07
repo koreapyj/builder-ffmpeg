@@ -18,9 +18,9 @@ continuous ingest.
 
 --- a/fftools/ffmpeg_demux.c
 +++ b/fftools/ffmpeg_demux.c
-@@ -80,6 +80,15 @@ typedef struct DemuxStream {
+@@ -81,6 +81,15 @@ typedef struct DemuxStream {
      int64_t                  next_dts;
-     ///< dts of the last packet read for this stream (in AV_TIME_BASE units)
+     /// dts of the last packet read for this stream (in AV_TIME_BASE units)
      int64_t                  dts;
 +    ///< last pre-unwrap reference timestamp (dts, or pts fallback) in AV_TIME_BASE units
 +    int64_t                  last_raw_dts;
@@ -34,7 +34,7 @@ continuous ingest.
  
      const AVCodecDescriptor *codec_desc;
  
-@@ -274,12 +283,102 @@ static void ts_discontinuity_detect(Demu
+@@ -290,12 +299,102 @@ static void ts_discontinuity_detect(Demu
      d->last_ts = av_rescale_q(pkt->dts, pkt->time_base, AV_TIME_BASE_Q);
  }
  
@@ -137,7 +137,7 @@ continuous ingest.
      // apply previously-detected timestamp-discontinuity offset
      // (to all streams, not just audio/video)
      if (pkt->dts != AV_NOPTS_VALUE)
-@@ -1240,6 +1339,7 @@ static DemuxStream *demux_stream_alloc(D
+@@ -1292,6 +1391,7 @@ static DemuxStream *demux_stream_alloc(D
  
      ds->sch_idx_stream = -1;
      ds->sch_idx_dec    = -1;

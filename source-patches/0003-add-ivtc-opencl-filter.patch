@@ -524,18 +524,18 @@ libavfilter/opencl_source.h.
 +    },
 +};
 +
-+const AVFilter ff_vf_ivtc_opencl = {
-+    .name           = "ivtc_opencl",
-+    .description    = NULL_IF_CONFIG_SMALL("Inverse telecine (field matching) through OpenCL."),
++const FFFilter ff_vf_ivtc_opencl = {
++    .p.name         = "ivtc_opencl",
++    .p.description  = NULL_IF_CONFIG_SMALL("Inverse telecine (field matching) through OpenCL."),
++    .p.priv_class   = &ivtc_opencl_class,
++    .p.flags        = AVFILTER_FLAG_HWDEVICE,
 +    .priv_size      = sizeof(IvtcOpenCLContext),
-+    .priv_class     = &ivtc_opencl_class,
 +    .init           = &ivtc_init,
 +    .uninit         = &ivtc_uninit,
 +    .activate       = &ff_ivtc_activate,
 +    FILTER_INPUTS(ivtc_opencl_inputs),
 +    FILTER_OUTPUTS(ivtc_opencl_outputs),
 +    FILTER_SINGLE_PIXFMT(AV_PIX_FMT_OPENCL),
-+    .flags          = AVFILTER_FLAG_HWDEVICE,
 +    .flags_internal = FF_FILTER_FLAG_HWFRAME_AWARE,
 +};
 --- /dev/null
@@ -868,19 +868,19 @@ libavfilter/opencl_source.h.
 +}
 --- a/libavfilter/allfilters.c
 +++ b/libavfilter/allfilters.c
-@@ -336,6 +336,7 @@ extern const AVFilter ff_vf_il;
- extern const AVFilter ff_vf_inflate;
- extern const AVFilter ff_vf_interlace;
- extern const AVFilter ff_vf_interleave;
-+extern const AVFilter ff_vf_ivtc_opencl;
- extern const AVFilter ff_vf_kerndeint;
- extern const AVFilter ff_vf_kirsch;
- extern const AVFilter ff_vf_lagfun;
+@@ -344,6 +344,7 @@ extern const FFFilter ff_vf_inflate;
+ extern const FFFilter ff_vf_interlace;
+ extern const FFFilter ff_vf_interlace_vulkan;
+ extern const FFFilter ff_vf_interleave;
++extern const FFFilter ff_vf_ivtc_opencl;
+ extern const FFFilter ff_vf_kerndeint;
+ extern const FFFilter ff_vf_kirsch;
+ extern const FFFilter ff_vf_lagfun;
 --- a/libavfilter/Makefile
 +++ b/libavfilter/Makefile
-@@ -365,6 +365,8 @@ OBJS-$(CONFIG_IL_FILTER)
- OBJS-$(CONFIG_INFLATE_FILTER)                += vf_neighbor.o
+@@ -375,6 +375,8 @@ OBJS-$(CONFIG_INFLATE_FILTER)
  OBJS-$(CONFIG_INTERLACE_FILTER)              += vf_tinterlace.o
+ OBJS-$(CONFIG_INTERLACE_VULKAN_FILTER)       += vf_interlace_vulkan.o vulkan.o vulkan_filter.o
  OBJS-$(CONFIG_INTERLEAVE_FILTER)             += f_interleave.o
 +OBJS-$(CONFIG_IVTC_OPENCL_FILTER)            += vf_ivtc_opencl.o opencl.o opencl/ivtc.o \
 +                                                ivtc_common.o
@@ -889,10 +889,10 @@ libavfilter/opencl_source.h.
  OBJS-$(CONFIG_LAGFUN_FILTER)                 += vf_lagfun.o
 --- a/configure
 +++ b/configure
-@@ -3922,6 +3922,7 @@ iccdetect_filter_deps="lcms2"
- iccgen_filter_deps="lcms2"
+@@ -4182,6 +4182,7 @@ iccgen_filter_deps="lcms2"
  identity_filter_select="scene_sad"
  interlace_filter_deps="gpl"
+ interlace_vulkan_filter_deps="vulkan spirv_library"
 +ivtc_opencl_filter_deps="opencl"
  kerndeint_filter_deps="gpl"
  ladspa_filter_deps="ladspa libdl"

@@ -9,11 +9,11 @@
 SHELL := /bin/bash
 
 FF_REPO  ?= https://github.com/jellyfin/jellyfin-ffmpeg.git
-FF_REF   ?= v7.1.4-3
+FF_REF   ?= v8.1.3-1
 
 # Default target = same as host (both overridable). Codename falls back to
 # bookworm if the host distro isn't one upstream's `build` script supports.
-SUPPORTED_CODENAMES := bullseye bookworm trixie jammy noble resolute
+SUPPORTED_CODENAMES := bookworm trixie jammy noble resolute
 HOST_CODENAME := $(shell . /etc/os-release 2>/dev/null; echo $$VERSION_CODENAME)
 CODENAME ?= $(if $(filter $(HOST_CODENAME),$(SUPPORTED_CODENAMES)),$(HOST_CODENAME),bookworm)
 ARCH     ?= $(shell dpkg --print-architecture 2>/dev/null || echo amd64)
@@ -138,12 +138,11 @@ image:
 		exit 0; \
 	fi; \
 	case "$(CODENAME)" in \
-	  bullseye) distro=debian:bullseye gcc=10 llvm=16 spirv=11;; \
 	  bookworm) distro=debian:bookworm gcc=12 llvm=19 spirv=15;; \
 	  trixie)   distro=debian:trixie   gcc=14 llvm=19 spirv=19;; \
 	  jammy)    distro=ubuntu:jammy    gcc=11 llvm=15 spirv=15;; \
-	  noble)    distro=ubuntu:noble    gcc=13 llvm=19 spirv=19;; \
-	  resolute) distro=ubuntu:resolute gcc=15 llvm=20 spirv=20;; \
+	  noble)    distro=ubuntu:noble    gcc=13 llvm=20 spirv=20;; \
+	  resolute) distro=ubuntu:resolute gcc=15 llvm=21 spirv=21;; \
 	  *) echo "Unsupported CODENAME=$(CODENAME)"; exit 1;; \
 	esac; \
 	echo "Generating base image $(BASE_IMAGE) ($$distro, gcc$$gcc, llvm$$llvm, $(ARCH))..."; \
@@ -175,7 +174,7 @@ run: image
 	@test -x $(SRC)/ffmpeg || { echo "Not built -- run 'make build' first"; exit 1; }
 	docker run --rm -it --entrypoint bash \
 		-v "$(CURDIR):/ws" -w /ws/$(SRC) "$(BUILDER_IMAGE)" \
-		-c 'for d in libav* libsw* libpostproc; do LD_LIBRARY_PATH=$$PWD/$$d:$$LD_LIBRARY_PATH; done; export LD_LIBRARY_PATH; ./ffmpeg $(if $(ARGS),$(ARGS),-version)'
+		-c 'for d in libav* libsw*; do LD_LIBRARY_PATH=$$PWD/$$d:$$LD_LIBRARY_PATH; done; export LD_LIBRARY_PATH; ./ffmpeg $(if $(ARGS),$(ARGS),-version)'
 
 # Faithful packaging path: identical flow to CI, but -nc (no-clean) reuses the
 # incremental object files from `make build`. Native arch only.
