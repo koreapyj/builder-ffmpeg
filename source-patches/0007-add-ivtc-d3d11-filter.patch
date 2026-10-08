@@ -1,0 +1,1163 @@
+--- a/configure
++++ b/configure
+@@ -4184,6 +4184,7 @@ interlace_filter_deps="gpl"
+ interlace_vulkan_filter_deps="vulkan spirv_library"
+ ivtc_cuda_filter_deps="ffnvcodec"
+ ivtc_cuda_filter_deps_any="cuda_nvcc cuda_llvm"
++ivtc_d3d11_filter_deps="d3d11va d3dcompiler_h"
+ ivtc_opencl_filter_deps="opencl"
+ kerndeint_filter_deps="gpl"
+ ladspa_filter_deps="ladspa libdl"
+--- a/libavfilter/Makefile
++++ b/libavfilter/Makefile
+@@ -377,6 +377,8 @@ OBJS-$(CONFIG_INTERLACE_VULKAN_FILTER)
+ OBJS-$(CONFIG_INTERLEAVE_FILTER)             += f_interleave.o
+ OBJS-$(CONFIG_IVTC_CUDA_FILTER)              += vf_ivtc_cuda.o vf_ivtc_cuda.ptx.o \
+                                                 ivtc_common.o cuda/load_helper.o
++OBJS-$(CONFIG_IVTC_D3D11_FILTER)             += vf_ivtc_d3d11.o d3d11/ivtc.o d3d11_filter.o \
++                                                ivtc_common.o
+ OBJS-$(CONFIG_IVTC_OPENCL_FILTER)            += vf_ivtc_opencl.o opencl.o opencl/ivtc.o \
+                                                 ivtc_common.o
+ OBJS-$(CONFIG_KERNDEINT_FILTER)              += vf_kerndeint.o
+--- a/libavfilter/allfilters.c
++++ b/libavfilter/allfilters.c
+@@ -345,6 +345,7 @@ extern const FFFilter ff_vf_interlace;
+ extern const FFFilter ff_vf_interlace_vulkan;
+ extern const FFFilter ff_vf_interleave;
+ extern const FFFilter ff_vf_ivtc_cuda;
++extern const FFFilter ff_vf_ivtc_d3d11;
+ extern const FFFilter ff_vf_ivtc_opencl;
+ extern const FFFilter ff_vf_kerndeint;
+ extern const FFFilter ff_vf_kirsch;
+--- /dev/null
++++ b/libavfilter/d3d11/ivtc.hlsl
+@@ -0,0 +1,253 @@
++/*
++ * Copyright (c) 2026
++ *
++ * These inverse-telecine kernels are ported from QSVEnc
++ * (QSVPipeline/rgy_filter_ivtc.cl) by rigaya, used under the MIT License:
++ *     QSVEnc/NVEnc/VCEEnc, Copyright (c) 2014-2016 rigaya.
++ *     https://github.com/rigaya/QSVEnc
++ *
++ * This file is part of FFmpeg.
++ *
++ * FFmpeg is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * FFmpeg is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with FFmpeg; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++/*
++ * D3D11 compute port of the field-matching / decimation kernels in
++ * vf_ivtc_cuda.cu. Planes are UNORM views (R8/R8G8 for NV12, R16/R16G16 for
++ * P010); every analysis read is rounded back to the raw container integer and
++ * multiplied by `scale`, so the values match the CUDA path (raw * scale):
++ * 0..255 luma units for the fieldmatch kernels, 0..1 for the decimation diff.
++ * Reads clamp to the plane edge like the CUDA/OpenCL kernels. The weave
++ * kernels copy whole fields and need no rounding.
++ */
++
++#define IVTC_WG 16
++#define IVTC_NT (IVTC_WG * IVTC_WG)
++
++// luma planes: cur/a (t0) and cand/b (t1); chroma planes for the weave
++Texture2DArray<float>  tex_a_y  : register(t0);
++Texture2DArray<float>  tex_b_y  : register(t1);
++Texture2DArray<float2> tex_a_uv : register(t2);
++Texture2DArray<float2> tex_b_uv : register(t3);
++
++RWStructuredBuffer<uint>  D_buf    : register(u0); // |cur-cand| per borrowed field row (w*hf)
++RWStructuredBuffer<uint>  F_buf    : register(u1); // build_diff_map flags (w*hf)
++RWStructuredBuffer<float> cmp_buf  : register(u2); // per-block compare_fields partials (nwg*6)
++RWStructuredBuffer<float> diff_buf : register(u3); // per-block luma SAD (IVTC_CYCLE slices of nwg)
++RWTexture2DArray<float>   dst_y    : register(u4);
++RWTexture2DArray<float2>  dst_uv   : register(u5);
++
++cbuffer Params : register(b0) {
++    int   width;
++    int   height;
++    int   hf;
++    int   tff;
++    int   nbx;
++    int   out_offset;   // ivtc_diff: slice offset into diff_buf
++    int   first;        // weave: parity of the rows taken from tex_a
++    int   pad0;
++    float scale;
++    float maxval;       // UNORM -> raw container integer
++    float pad1;
++    float pad2;
++};
++
++groupshared float l[IVTC_NT * 6];
++
++float px_a(int x, int y)
++{
++    x = min(max(x, 0), width - 1);
++    y = min(max(y, 0), height - 1);
++    return round(tex_a_y.Load(int4(x, y, 0, 0)) * maxval) * scale;
++}
++
++float px_b(int x, int y)
++{
++    x = min(max(x, 0), width - 1);
++    y = min(max(y, 0), height - 1);
++    return round(tex_b_y.Load(int4(x, y, 0, 0)) * maxval) * scale;
++}
++
++/* =====================================================================
++ * vf_fieldmatch compare_fields port (Stage 1: C-vs-P primary match).
++ * See vf_ivtc_cuda.cu: works in 0..255 luma units so fieldmatch's integer
++ * thresholds (3,19,23,42) apply unchanged; "field rows" index the borrowed
++ * parity: borrowed image row yb = 2*fy + (tff?1:0).
++ * ===================================================================== */
++
++// |cur.borrowed - cand.borrowed| per borrowed field row -> D[fy*width + x] (0..255)
++[numthreads(IVTC_WG, IVTC_WG, 1)]
++void fm_absdiff(uint3 id : SV_DispatchThreadID)
++{
++    int x  = id.x;
++    int fy = id.y;
++    if (x >= width || fy >= hf)
++        return;
++    int yb = 2 * fy + (tff ? 1 : 0);
++    float d = abs(px_a(x, yb) - px_b(x, yb));
++    D_buf[fy * width + x] = d > 255.0f ? 255 : (uint)(int)(d + 0.5f);
++}
++
++// build_diff_map: flag bits 1/2/4 per field-row diff magnitude + clustering.
++[numthreads(IVTC_WG, IVTC_WG, 1)]
++void fm_diffmap(uint3 id : SV_DispatchThreadID)
++{
++    int x  = id.x;
++    int fy = id.y;
++    int u, count;
++    if (x >= width || fy >= hf)
++        return;
++    F_buf[fy * width + x] = 0;
++    if (fy < 1 || fy >= hf - 1 || x < 1 || x >= width - 1)
++        return;
++    int diff = D_buf[fy * width + x];
++    if (diff <= 3)
++        return;
++    count = 0;
++    for (u = x - 1; u < x + 2 && count < 2; u++) {
++        count += D_buf[(fy - 1) * width + u] > 3;
++        count += D_buf[ fy      * width + u] > 3;
++        count += D_buf[(fy + 1) * width + u] > 3;
++    }
++    if (count <= 1)
++        return;
++    uint f = 1;
++    if (diff > 19) {
++        int upper = 0, lower = 0;
++        count = 0;
++        for (u = x - 1; u < x + 2 && count < 6; u++) {
++            if (D_buf[(fy - 1) * width + u] > 19) { count++; upper = 1; }
++            if (D_buf[ fy      * width + u] > 19)   count++;
++            if (D_buf[(fy + 1) * width + u] > 19) { count++; lower = 1; }
++        }
++        if (count > 3) {
++            if (upper && lower) {
++                f |= 1 << 1;
++            } else {
++                int upper2 = 0, lower2 = 0;
++                int ulo = max(x - 4, 0), uhi = min(x + 5, width);
++                for (u = ulo; u < uhi; u++) {
++                    if (fy >= 2      && D_buf[(fy - 2) * width + u] > 19) upper2 = 1;
++                    if (                D_buf[(fy - 1) * width + u] > 19) upper  = 1;
++                    if (                D_buf[(fy + 1) * width + u] > 19) lower  = 1;
++                    if (fy < hf - 2  && D_buf[(fy + 2) * width + u] > 19) lower2 = 1;
++                }
++                if ((upper && (lower || upper2)) || (lower && (upper || lower2)))
++                    f |= 1 << 1;
++                else if (count > 5)
++                    f |= 1 << 2;
++            }
++        }
++    }
++    F_buf[fy * width + x] = f;
++}
++
++// compare_fields accumulation for match1=C (cur, tex_a) vs match2=cand (tex_b).
++// Each group writes 6 partials: {Ac,Am,Aml, Bc,Bm,Bml} -> cmp_buf[blk*6 + 0..5].
++[numthreads(IVTC_WG, IVTC_WG, 1)]
++void fm_compare_accum(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupID,
++                      uint tid : SV_GroupIndex)
++{
++    int x  = id.x;
++    int y  = id.y;
++    int kp = tff ? 0 : 1;              // kept parity
++    int bf = tff ? 1 : 0;              // borrowed parity
++    uint k, s;
++
++    float Ac = 0, Am = 0, Aml = 0, Bc = 0, Bm = 0, Bml = 0;
++    if (x >= 8 && x < width - 8 && (y & 1) == kp && y >= 2 && y < height - 2) {
++        float t1 = px_a(x, y - 2) + 4.0f * px_a(x, y) + px_a(x, y + 2);
++        float a  = abs(3.0f * (px_a(x, y - 1) + px_a(x, y + 1)) - t1);
++        float b  = abs(3.0f * (px_b(x, y - 1) + px_b(x, y + 1)) - t1);
++        // mask flags at the two borrowed field rows adjacent to kept row y
++        int fa = (y - 1 - bf) >> 1, fb = (y + 1 - bf) >> 1;
++        uint m = 0;
++        if (fa >= 0 && fa < hf) m |= F_buf[fa * width + x];
++        if (fb >= 0 && fb < hf) m |= F_buf[fb * width + x];
++        if (a > 23.0f && (m & 1)) Ac += a;
++        if (a > 42.0f) { if (m & 2) Am += a; if (m & 4) Aml += a; }
++        if (b > 23.0f && (m & 1)) Bc += b;
++        if (b > 42.0f) { if (m & 2) Bm += b; if (m & 4) Bml += b; }
++    }
++
++    // planar layout l[k*NT + tid], same tree as the CUDA kernel
++    l[0*IVTC_NT+tid] = Ac; l[1*IVTC_NT+tid] = Am; l[2*IVTC_NT+tid] = Aml;
++    l[3*IVTC_NT+tid] = Bc; l[4*IVTC_NT+tid] = Bm; l[5*IVTC_NT+tid] = Bml;
++    GroupMemoryBarrierWithGroupSync();
++    for (s = IVTC_NT / 2; s > 0; s >>= 1) {
++        if (tid < s)
++            for (k = 0; k < 6; k++)
++                l[k*IVTC_NT+tid] += l[k*IVTC_NT+tid+s];
++        GroupMemoryBarrierWithGroupSync();
++    }
++    if (tid == 0) {
++        uint blk = gid.y * nbx + gid.x;
++        for (k = 0; k < 6; k++)
++            cmp_buf[blk*6+k] = l[k*IVTC_NT];
++    }
++}
++
++/*
++ * Luma SAD between two frames for decimation duplicate detection. Each group
++ * writes its partial sum to diff_buf[out_offset + blk]; the host reduces.
++ */
++[numthreads(IVTC_WG, IVTC_WG, 1)]
++void ivtc_diff(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupID,
++               uint tid : SV_GroupIndex)
++{
++    int x = id.x;
++    int y = id.y;
++    uint s;
++
++    float d = 0.0f;
++    if (x < width && y < height)
++        d = abs(px_a(x, y) - px_b(x, y));
++
++    l[tid] = d;
++    GroupMemoryBarrierWithGroupSync();
++    for (s = IVTC_NT / 2; s > 0; s >>= 1) {
++        if (tid < s)
++            l[tid] += l[tid + s];
++        GroupMemoryBarrierWithGroupSync();
++    }
++    if (tid == 0)
++        diff_buf[out_offset + gid.y * nbx + gid.x] = l[0];
++}
++
++/*
++ * Field weave: rows of parity `first` come from tex_a, the others from tex_b
++ * (the CUDA backend does this with pitched 2D copies).
++ */
++[numthreads(IVTC_WG, IVTC_WG, 1)]
++void weave_y(uint3 id : SV_DispatchThreadID)
++{
++    int x = id.x;
++    int y = id.y;
++    if (x >= width || y >= height)
++        return;
++    dst_y[uint3(x, y, 0)] = (y & 1) == first ? tex_a_y.Load(int4(x, y, 0, 0))
++                                             : tex_b_y.Load(int4(x, y, 0, 0));
++}
++
++[numthreads(IVTC_WG, IVTC_WG, 1)]
++void weave_uv(uint3 id : SV_DispatchThreadID)
++{
++    int x = id.x;
++    int y = id.y;
++    if (x >= (width + 1) >> 1 || y >= (height + 1) >> 1)
++        return;
++    dst_uv[uint3(x, y, 0)] = (y & 1) == first ? tex_a_uv.Load(int4(x, y, 0, 0))
++                                              : tex_b_uv.Load(int4(x, y, 0, 0));
++}
+--- a/libavfilter/d3d11_source.h
++++ b/libavfilter/d3d11_source.h
+@@ -24,6 +24,7 @@
+ #define AVFILTER_D3D11_SOURCE_H
+ 
+ extern const char *ff_source_deint_hlsl;
++extern const char *ff_source_ivtc_hlsl;
+ extern const char *ff_source_overlay_hlsl;
+ extern const char *ff_source_scale_hlsl;
+ extern const char *ff_source_tonemap_hlsl;
+--- a/libavfilter/ivtc.h
++++ b/libavfilter/ivtc.h
+@@ -25,10 +25,11 @@
+ 
+ /*
+  * Backend-agnostic core of the hardware inverse-telecine filters
+- * (ivtc_opencl, ivtc_cuda), in the style of yadif_common.c: the field-match
+- * decision, 5-frame decimation cycle, soft-pulldown (RFF) expansion and emit
+- * timing live in ivtc_common.c; each backend embeds IVTCContext as the first
+- * member of its private context and supplies the GPU hooks below.
++ * (ivtc_opencl, ivtc_cuda, ivtc_d3d11), in the style of yadif_common.c: the
++ * field-match decision, 5-frame decimation cycle, soft-pulldown (RFF)
++ * expansion and emit timing live in ivtc_common.c; each backend embeds
++ * IVTCContext as the first member of its private context and supplies the GPU
++ * hooks below.
+  */
+ 
+ #ifndef AVFILTER_IVTC_H
+--- /dev/null
++++ b/libavfilter/vf_ivtc_d3d11.c
+@@ -0,0 +1,845 @@
++/*
++ * Copyright (c) 2026
++ *
++ * The inverse-telecine field-matching algorithm and the kernels in
++ * d3d11/ivtc.hlsl are ported from QSVEnc (QSVPipeline/rgy_filter_ivtc) by
++ * rigaya, used under the MIT License:
++ *     QSVEnc/NVEnc/VCEEnc, Copyright (c) 2014-2016 rigaya.
++ *     https://github.com/rigaya/QSVEnc
++ * The D3D11 filter scaffolding follows vf_yadif_d3d11.c.
++ *
++ * This file is part of FFmpeg.
++ *
++ * FFmpeg is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * FFmpeg is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with FFmpeg; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++/*
++ * vf_ivtc_d3d11 -- hardware inverse telecine (field-matching) through D3D11
++ * compute shaders.
++ *
++ * The D3D11 backend of the shared ivtc core (ivtc_common.c), for the
++ * zero-copy d3d11va/AMF/QSV decode -> D3D11 -> encode chain on Windows:
++ *   -hwaccel d3d11va -hwaccel_output_format d3d11 ... -vf ivtc_d3d11 -c:v h264_amf
++ *
++ * Everything runs on the compute engine (not the video processor), issued
++ * on the device's immediate context, which orders all work; the only waits
++ * are the staging-buffer reads of the match accumulators (one per frame) and
++ * of the decimation diffs (one per 5-frame cycle). Frames whose textures
++ * cannot be viewed directly by a shader (e.g. decoder surfaces without
++ * D3D11_BIND_SHADER_RESOURCE) are copied to internal textures first.
++ */
++
++#include "libavutil/avassert.h"
++#include "libavutil/common.h"
++#include "libavutil/hwcontext.h"
++#include "libavutil/hwcontext_d3d11va.h"
++#include "libavutil/mem.h"
++#include "libavutil/opt.h"
++#include "libavutil/pixdesc.h"
++
++#include "avfilter.h"
++#include "filters.h"
++#include "ivtc.h"
++#include "video.h"
++#include "d3d11_source.h"
++#include "d3d11_filter.h"
++
++#define DIV_UP(a, b) ( ((a) + (b) - 1) / (b) )
++
++#define IVTC_D3D11_NB_SCRATCH 2
++#define IVTC_D3D11_POOL_SIZE  16   // fixed array: cycle + dec_prev + downstream refs
++
++enum { BUF_D, BUF_F, BUF_CMP, BUF_DIFF, BUF_NB };
++
++// must match cbuffer Params in d3d11/ivtc.hlsl
++typedef struct IvtcD3D11Params {
++    int   width;
++    int   height;
++    int   hf;
++    int   tff;
++    int   nbx;
++    int   out_offset;
++    int   first;
++    int   pad0;
++    float scale;
++    float maxval;
++    float pad1;
++    float pad2;
++} IvtcD3D11Params;
++
++typedef struct IvtcD3D11Context {
++    IVTCContext ivtc;
++
++    AVD3D11VADeviceContext *hwctx;
++    AVBufferRef            *device_ref;
++    AVBufferRef            *input_frames_ref;
++    AVHWFramesContext      *input_frames;
++    AVHWFramesContext      *output_frames;
++
++    ID3D11Device        *device;
++    ID3D11DeviceContext *context;
++    HMODULE              d3dcompiler;
++    FFD3DCompileProc     D3DCompile;
++
++    enum AVPixelFormat sw_format;
++    DXGI_FORMAT        tex_format;
++    float       scale_fm;         // raw luma -> 0..255 (fieldmatch units)
++    float       scale_diff;       // raw luma -> 0..1   (decimation units)
++    float       maxval;           // UNORM -> raw container integer
++
++    ID3D11ComputeShader *cs_absdiff;
++    ID3D11ComputeShader *cs_diffmap;
++    ID3D11ComputeShader *cs_compare;
++    ID3D11ComputeShader *cs_diff;
++    ID3D11ComputeShader *cs_weave_y;
++    ID3D11ComputeShader *cs_weave_uv;
++    ID3D11Buffer        *params_buf;
++
++    ID3D11Buffer              *bufs[BUF_NB];     // D, F, cmp partials, diff partials
++    ID3D11UnorderedAccessView *buf_uavs[BUF_NB];
++    ID3D11Buffer              *cmp_staging;
++    ID3D11Buffer              *diff_staging;
++    ID3D11Query               *event;
++    float                     *cmp_host;
++    float                     *diff_host;
++
++    // copies of frames that cannot be viewed directly, and the weave target
++    ID3D11Texture2D *scratch[IVTC_D3D11_NB_SCRATCH];
++    int              scratch_w[IVTC_D3D11_NB_SCRATCH], scratch_h[IVTC_D3D11_NB_SCRATCH];
++    ID3D11Texture2D *work_tex;
++    int              work_w, work_h;
++
++    int direct_srv[2];            // input pool, output pool: -1 unknown, 0 copy, 1 direct
++    int direct_output_uav;
++    int force_output_copy;
++} IvtcD3D11Context;
++
++// ---- helpers --------------------------------------------------------------
++
++static void ivtc_d3d11_lock(IvtcD3D11Context *ctx)
++{
++    ctx->hwctx->lock(ctx->hwctx->lock_ctx);
++}
++
++static void ivtc_d3d11_unlock(IvtcD3D11Context *ctx)
++{
++    ctx->hwctx->unlock(ctx->hwctx->lock_ctx);
++}
++
++static int ivtc_d3d11_create_buffer(AVFilterContext *avctx, UINT stride, UINT count,
++                                    ID3D11Buffer **buf, ID3D11UnorderedAccessView **uav)
++{
++    IvtcD3D11Context *ctx = avctx->priv;
++    D3D11_BUFFER_DESC bd = { 0 };
++    D3D11_UNORDERED_ACCESS_VIEW_DESC ud = { 0 };
++    HRESULT hr;
++
++    count = FFMAX(count, 1);
++    bd.ByteWidth           = stride * count;
++    bd.Usage               = D3D11_USAGE_DEFAULT;
++    bd.BindFlags           = D3D11_BIND_UNORDERED_ACCESS;
++    bd.MiscFlags           = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
++    bd.StructureByteStride = stride;
++    hr = ctx->device->lpVtbl->CreateBuffer(ctx->device, &bd, NULL, buf);
++    if (FAILED(hr))
++        goto fail;
++
++    ud.Format             = DXGI_FORMAT_UNKNOWN;
++    ud.ViewDimension      = D3D11_UAV_DIMENSION_BUFFER;
++    ud.Buffer.NumElements = count;
++    hr = ctx->device->lpVtbl->CreateUnorderedAccessView(ctx->device, (ID3D11Resource *)*buf,
++                                                        &ud, uav);
++    if (FAILED(hr))
++        goto fail;
++    return 0;
++
++fail:
++    av_log(avctx, AV_LOG_ERROR, "Failed creating ivtc buffer: HRESULT 0x%lX\n",
++           (unsigned long)hr);
++    return AVERROR_EXTERNAL;
++}
++
++static int ivtc_d3d11_create_staging(AVFilterContext *avctx, UINT size, ID3D11Buffer **buf)
++{
++    IvtcD3D11Context *ctx = avctx->priv;
++    D3D11_BUFFER_DESC bd = { 0 };
++    HRESULT hr;
++
++    bd.ByteWidth      = FFMAX(size, 4);
++    bd.Usage          = D3D11_USAGE_STAGING;
++    bd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
++    hr = ctx->device->lpVtbl->CreateBuffer(ctx->device, &bd, NULL, buf);
++    if (FAILED(hr)) {
++        av_log(avctx, AV_LOG_ERROR, "Failed creating ivtc staging buffer: HRESULT 0x%lX\n",
++               (unsigned long)hr);
++        return AVERROR_EXTERNAL;
++    }
++    return 0;
++}
++
++// Copy a partials buffer to its staging twin and map it. The map blocks until
++// the immediate context has executed everything before it (incl. prior synths).
++static int ivtc_d3d11_readback(AVFilterContext *avctx, ID3D11Buffer *src,
++                               ID3D11Buffer *staging, void *dst, size_t size)
++{
++    IvtcD3D11Context *ctx = avctx->priv;
++    D3D11_MAPPED_SUBRESOURCE mapped;
++    HRESULT hr;
++
++    ctx->context->lpVtbl->CopyResource(ctx->context, (ID3D11Resource *)staging,
++                                       (ID3D11Resource *)src);
++    hr = ctx->context->lpVtbl->Map(ctx->context, (ID3D11Resource *)staging, 0,
++                                   D3D11_MAP_READ, 0, &mapped);
++    if (FAILED(hr)) {
++        av_log(avctx, AV_LOG_ERROR, "Failed mapping ivtc staging buffer: HRESULT 0x%lX\n",
++               (unsigned long)hr);
++        return AVERROR_EXTERNAL;
++    }
++    memcpy(dst, mapped.pData, size);
++    ctx->context->lpVtbl->Unmap(ctx->context, (ID3D11Resource *)staging, 0);
++    return 0;
++}
++
++static int ivtc_d3d11_set_params(AVFilterContext *avctx, const IvtcD3D11Params *params)
++{
++    IvtcD3D11Context *ctx = avctx->priv;
++    D3D11_MAPPED_SUBRESOURCE mapped;
++    HRESULT hr;
++
++    hr = ctx->context->lpVtbl->Map(ctx->context, (ID3D11Resource *)ctx->params_buf,
++                                   0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
++    if (FAILED(hr)) {
++        av_log(avctx, AV_LOG_ERROR, "Failed mapping ivtc constant buffer: HRESULT 0x%lX\n",
++               (unsigned long)hr);
++        return AVERROR_EXTERNAL;
++    }
++    memcpy(mapped.pData, params, sizeof(*params));
++    ctx->context->lpVtbl->Unmap(ctx->context, (ID3D11Resource *)ctx->params_buf, 0);
++    return 0;
++}
++
++// Bind SRVs t0..t3 and UAVs (from uav_start), run one grid, unbind everything.
++static void ivtc_d3d11_dispatch(IvtcD3D11Context *ctx, ID3D11ComputeShader *cs,
++                                ID3D11ShaderResourceView *const srvs[4],
++                                UINT uav_start, UINT nb_uavs,
++                                ID3D11UnorderedAccessView *const *uavs,
++                                int grid_x, int grid_y)
++{
++    ID3D11DeviceContext *dc = ctx->context;
++    ID3D11ShaderResourceView *null_srvs[4] = { NULL };
++    ID3D11UnorderedAccessView *null_uavs[BUF_NB] = { NULL };
++
++    dc->lpVtbl->CSSetShader(dc, cs, NULL, 0);
++    dc->lpVtbl->CSSetConstantBuffers(dc, 0, 1, &ctx->params_buf);
++    dc->lpVtbl->CSSetShaderResources(dc, 0, 4, (ID3D11ShaderResourceView **)srvs);
++    dc->lpVtbl->CSSetUnorderedAccessViews(dc, uav_start, nb_uavs,
++                                          (ID3D11UnorderedAccessView **)uavs, NULL);
++    dc->lpVtbl->Dispatch(dc, grid_x, grid_y, 1);
++    dc->lpVtbl->CSSetUnorderedAccessViews(dc, uav_start, nb_uavs, null_uavs, NULL);
++    dc->lpVtbl->CSSetShaderResources(dc, 0, 4, null_srvs);
++    dc->lpVtbl->CSSetShader(dc, NULL, NULL, 0);
++}
++
++static void ivtc_d3d11_release_views(ID3D11ShaderResourceView **srvs, int n)
++{
++    for (int i = 0; i < n; i++)
++        FF_D3D11_RELEASE(srvs[i]);
++}
++
++// SRVs on the Y (and, if srv_uv, UV) plane of a frame: directly on its
++// texture slice when the pool allows it, else on a copy in scratch[slot].
++static int ivtc_d3d11_frame_srvs(AVFilterContext *avctx, AVFrame *frame, int slot,
++                                 ID3D11ShaderResourceView **srv_y,
++                                 ID3D11ShaderResourceView **srv_uv)
++{
++    IvtcD3D11Context *ctx = avctx->priv;
++    int pool = frame->hw_frames_ctx &&
++               frame->hw_frames_ctx->data == (uint8_t *)ctx->output_frames;
++    int *direct = &ctx->direct_srv[pool];
++    ID3D11Texture2D *tex = (ID3D11Texture2D *)frame->data[0];
++    UINT sub = (UINT)(uintptr_t)frame->data[1];
++    int ret;
++
++    if (*direct) {
++        ret = ff_d3d11_create_srv(avctx, ctx->device, tex, sub,
++                                  ff_d3d11_plane_format(ctx->sw_format, 0),
++                                  AV_LOG_DEBUG, "ivtc", srv_y);
++        if (ret >= 0 && srv_uv)
++            ret = ff_d3d11_create_srv(avctx, ctx->device, tex, sub,
++                                      ff_d3d11_plane_format(ctx->sw_format, 1),
++                                      AV_LOG_DEBUG, "ivtc", srv_uv);
++        if (ret >= 0) {
++            if (*direct < 0)
++                av_log(avctx, AV_LOG_DEBUG, "%s frames: direct SRV\n", pool ? "output" : "input");
++            *direct = 1;
++            return 0;
++        }
++        FF_D3D11_RELEASE(*srv_y);
++        if (srv_uv)
++            FF_D3D11_RELEASE(*srv_uv);
++        if (*direct > 0)
++            return ret;     // worked before: a real failure, not a pool limitation
++        av_log(avctx, AV_LOG_DEBUG, "%s frames: copied to internal SRV texture\n",
++               pool ? "output" : "input");
++        *direct = 0;
++    }
++
++    ret = ff_d3d11_ensure_texture(avctx, ctx->device, &ctx->scratch[slot],
++                                  &ctx->scratch_w[slot], &ctx->scratch_h[slot], NULL,
++                                  frame->width, frame->height, ctx->tex_format,
++                                  D3D11_BIND_SHADER_RESOURCE, "ivtc scratch");
++    if (ret < 0)
++        return ret;
++    ff_d3d11_copy_frame_to_texture(ctx->context, frame, ctx->scratch[slot]);
++
++    ret = ff_d3d11_create_srv(avctx, ctx->device, ctx->scratch[slot], 0,
++                              ff_d3d11_plane_format(ctx->sw_format, 0),
++                              AV_LOG_ERROR, "ivtc scratch", srv_y);
++    if (ret >= 0 && srv_uv) {
++        ret = ff_d3d11_create_srv(avctx, ctx->device, ctx->scratch[slot], 0,
++                                  ff_d3d11_plane_format(ctx->sw_format, 1),
++                                  AV_LOG_ERROR, "ivtc scratch", srv_uv);
++        if (ret < 0)
++            FF_D3D11_RELEASE(*srv_y);
++    }
++    return ret;
++}
++
++static void ivtc_d3d11_sync(AVFilterContext *avctx)
++{
++    IvtcD3D11Context *ctx = avctx->priv;
++    D3D11_QUERY_DESC qd = { D3D11_QUERY_EVENT, 0 };
++    HRESULT hr;
++
++    if (!ctx->context)
++        return;
++    ivtc_d3d11_lock(ctx);
++    if (!ctx->event) {
++        hr = ctx->device->lpVtbl->CreateQuery(ctx->device, &qd, &ctx->event);
++        if (FAILED(hr)) {
++            av_log(avctx, AV_LOG_WARNING, "Failed creating D3D11 event query: HRESULT 0x%lX\n",
++                   (unsigned long)hr);
++            ctx->event = NULL;
++        }
++    }
++    if (ctx->event) {
++        ctx->context->lpVtbl->End(ctx->context, (ID3D11Asynchronous *)ctx->event);
++        ctx->context->lpVtbl->Flush(ctx->context);
++        while ((hr = ctx->context->lpVtbl->GetData(ctx->context, (ID3D11Asynchronous *)ctx->event,
++                                                   NULL, 0, 0)) == S_FALSE)
++            SwitchToThread();
++    }
++    ivtc_d3d11_unlock(ctx);
++}
++
++// ---- one-time GPU init (shaders, score/diff buffers) ----------------------
++
++static int ivtc_init_d3d11(AVFilterContext *avctx)
++{
++    IvtcD3D11Context *ctx = avctx->priv;
++    IVTCContext *s = &ctx->ivtc;
++    UINT field_px = (UINT)s->luma_w * s->luma_hf;
++    static const struct {
++        const char *entry;
++        size_t offset;
++    } shaders[] = {
++        { "fm_absdiff",       offsetof(IvtcD3D11Context, cs_absdiff)  },
++        { "fm_diffmap",       offsetof(IvtcD3D11Context, cs_diffmap)  },
++        { "fm_compare_accum", offsetof(IvtcD3D11Context, cs_compare)  },
++        { "ivtc_diff",        offsetof(IvtcD3D11Context, cs_diff)     },
++        { "weave_y",          offsetof(IvtcD3D11Context, cs_weave_y)  },
++        { "weave_uv",         offsetof(IvtcD3D11Context, cs_weave_uv) },
++    };
++    int ret, i;
++
++    ret = ff_d3d11_load_shader_compiler(avctx, &ctx->d3dcompiler, &ctx->D3DCompile);
++    if (ret < 0)
++        return ret;
++
++    ivtc_d3d11_lock(ctx);
++    for (i = 0; i < FF_ARRAY_ELEMS(shaders); i++) {
++        ret = ff_d3d11_compile_shader(avctx, ctx->device, ctx->D3DCompile,
++                                      ff_source_ivtc_hlsl, NULL, shaders[i].entry,
++                                      "cs_5_0", "ivtc",
++                                      (ID3D11ComputeShader **)((uint8_t *)ctx + shaders[i].offset));
++        if (ret < 0)
++            goto exit;
++    }
++
++    if ((ret = ff_d3d11_create_const_buffer(avctx, ctx->device, sizeof(IvtcD3D11Params),
++                                            "ivtc", &ctx->params_buf)) < 0 ||
++        (ret = ivtc_d3d11_create_buffer(avctx, sizeof(uint32_t), field_px,
++                                        &ctx->bufs[BUF_D], &ctx->buf_uavs[BUF_D])) < 0 ||
++        (ret = ivtc_d3d11_create_buffer(avctx, sizeof(uint32_t), field_px,
++                                        &ctx->bufs[BUF_F], &ctx->buf_uavs[BUF_F])) < 0 ||
++        (ret = ivtc_d3d11_create_buffer(avctx, sizeof(float), s->nwg * 6,
++                                        &ctx->bufs[BUF_CMP], &ctx->buf_uavs[BUF_CMP])) < 0 ||
++        (ret = ivtc_d3d11_create_buffer(avctx, sizeof(float), s->nwg * IVTC_CYCLE,
++                                        &ctx->bufs[BUF_DIFF], &ctx->buf_uavs[BUF_DIFF])) < 0 ||
++        (ret = ivtc_d3d11_create_staging(avctx, s->nwg * 6 * sizeof(float),
++                                         &ctx->cmp_staging)) < 0 ||
++        (ret = ivtc_d3d11_create_staging(avctx, s->nwg * IVTC_CYCLE * sizeof(float),
++                                         &ctx->diff_staging)) < 0)
++        goto exit;
++
++    ctx->cmp_host  = av_malloc_array(s->nwg, 6 * sizeof(float));
++    ctx->diff_host = av_calloc((size_t)s->nwg * IVTC_CYCLE, sizeof(float));
++    if (!ctx->cmp_host || !ctx->diff_host)
++        ret = AVERROR(ENOMEM);
++
++exit:
++    ivtc_d3d11_unlock(ctx);
++    return ret;
++}
++
++// ---- GPU hooks ------------------------------------------------------------
++
++// compare_fields accumulators (C vs P) in three chained shaders, then one
++// blocking readback of the per-group partials, summed here.
++static int ivtc_d3d11_match_accum(AVFilterContext *avctx, AVFrame *prevf, AVFrame *curf,
++                                  AVFrame *nextf, int tff, double A[3], double B[3])
++{
++    IvtcD3D11Context *ctx = avctx->priv;
++    IVTCContext *s = &ctx->ivtc;
++    ID3D11ShaderResourceView *srvs[4] = { NULL };
++    IvtcD3D11Params params = {
++        .width  = s->luma_w,
++        .height = s->luma_h,
++        .hf     = s->luma_hf,
++        .tff    = tff,
++        .nbx    = s->nwgx,
++        .scale  = ctx->scale_fm,
++        .maxval = ctx->maxval,
++    };
++    int w = s->luma_w, hf = s->luma_hf;
++    int ret, i;
++
++    (void)nextf;
++
++    ivtc_d3d11_lock(ctx);
++    if ((ret = ivtc_d3d11_frame_srvs(avctx, curf,  0, &srvs[0], NULL)) < 0 ||
++        (ret = ivtc_d3d11_frame_srvs(avctx, prevf, 1, &srvs[1], NULL)) < 0 ||
++        (ret = ivtc_d3d11_set_params(avctx, &params)) < 0)
++        goto exit;
++
++    if (hf > 0) {
++        ivtc_d3d11_dispatch(ctx, ctx->cs_absdiff, srvs, 0, BUF_NB, ctx->buf_uavs,
++                            DIV_UP(w, IVTC_WG), DIV_UP(hf, IVTC_WG));
++        ivtc_d3d11_dispatch(ctx, ctx->cs_diffmap, srvs, 0, BUF_NB, ctx->buf_uavs,
++                            DIV_UP(w, IVTC_WG), DIV_UP(hf, IVTC_WG));
++    }
++    ivtc_d3d11_dispatch(ctx, ctx->cs_compare, srvs, 0, BUF_NB, ctx->buf_uavs,
++                        s->nwgx, s->nwgy);
++    ret = ivtc_d3d11_readback(avctx, ctx->bufs[BUF_CMP], ctx->cmp_staging,
++                              ctx->cmp_host, (size_t)s->nwg * 6 * sizeof(float));
++    if (ret < 0)
++        goto exit;
++
++    for (i = 0; i < s->nwg; i++) {
++        A[0] += ctx->cmp_host[i*6+0]; A[1] += ctx->cmp_host[i*6+1]; A[2] += ctx->cmp_host[i*6+2];
++        B[0] += ctx->cmp_host[i*6+3]; B[1] += ctx->cmp_host[i*6+4]; B[2] += ctx->cmp_host[i*6+5];
++    }
++
++exit:
++    ivtc_d3d11_release_views(srvs, 4);
++    ivtc_d3d11_unlock(ctx);
++    return ret;
++}
++
++// UAVs on dst's planes when the output pool allows it, else on work_tex.
++static int ivtc_d3d11_output_uavs(AVFilterContext *avctx, AVFrame *dst,
++                                  ID3D11UnorderedAccessView **uavs, int *direct)
++{
++    IvtcD3D11Context *ctx = avctx->priv;
++    int ret;
++
++    *direct = 0;
++    if (ctx->direct_output_uav) {
++        ID3D11Texture2D *tex = (ID3D11Texture2D *)dst->data[0];
++        UINT sub = (UINT)(uintptr_t)dst->data[1];
++        ret = ff_d3d11_create_uav(avctx, ctx->device, tex, sub,
++                                  ff_d3d11_plane_format(ctx->sw_format, 0),
++                                  AV_LOG_DEBUG, "ivtc", &uavs[0]);
++        if (ret >= 0)
++            ret = ff_d3d11_create_uav(avctx, ctx->device, tex, sub,
++                                      ff_d3d11_plane_format(ctx->sw_format, 1),
++                                      AV_LOG_DEBUG, "ivtc", &uavs[1]);
++        if (ret >= 0) {
++            *direct = 1;
++            return 0;
++        }
++        FF_D3D11_RELEASE(uavs[0]);
++        FF_D3D11_RELEASE(uavs[1]);
++        av_log(avctx, AV_LOG_DEBUG, "D3D11 shader output: copied from internal UAV texture\n");
++        ctx->direct_output_uav = 0;
++    }
++
++    ret = ff_d3d11_ensure_texture(avctx, ctx->device, &ctx->work_tex,
++                                  &ctx->work_w, &ctx->work_h, NULL,
++                                  dst->width, dst->height, ctx->tex_format,
++                                  D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS,
++                                  "ivtc work");
++    if (ret < 0)
++        return ret;
++    ret = ff_d3d11_create_uav(avctx, ctx->device, ctx->work_tex, 0,
++                              ff_d3d11_plane_format(ctx->sw_format, 0),
++                              AV_LOG_ERROR, "ivtc work", &uavs[0]);
++    if (ret >= 0)
++        ret = ff_d3d11_create_uav(avctx, ctx->device, ctx->work_tex, 0,
++                                  ff_d3d11_plane_format(ctx->sw_format, 1),
++                                  AV_LOG_ERROR, "ivtc work", &uavs[1]);
++    if (ret < 0)
++        FF_D3D11_RELEASE(uavs[0]);
++    return ret;
++}
++
++// Weave the chosen match into dst (all planes), candidate geometry as in
++// opencl/ivtc.cl: C keeps cur; P/N keep cur's first field and borrow the
++// second from prev/next; B/U keep cur's second field and borrow the first.
++static int ivtc_d3d11_synth(AVFilterContext *avctx, AVFrame *dst, AVFrame *prev,
++                            AVFrame *cur, AVFrame *next, int tff, int match)
++{
++    IvtcD3D11Context *ctx = avctx->priv;
++    IVTCContext *s = &ctx->ivtc;
++    ID3D11ShaderResourceView *srvs[4] = { NULL };   // first Y, second Y, first UV, second UV
++    ID3D11UnorderedAccessView *uavs[2] = { NULL };
++    IvtcD3D11Params params = {
++        .width  = s->luma_w,
++        .height = s->luma_h,
++        .first  = tff ? 0 : 1,   // parity of the first (top) field rows
++    };
++    AVFrame *src_first, *src_second;
++    int direct = 0, ret;
++
++    switch (match) {
++    case 1:  src_first = cur;  src_second = prev; break; // P
++    case 2:  src_first = cur;  src_second = next; break; // N
++    case 3:  src_first = prev; src_second = cur;  break; // B
++    case 4:  src_first = next; src_second = cur;  break; // U
++    default: src_first = cur;  src_second = cur;  break; // C
++    }
++
++    ivtc_d3d11_lock(ctx);
++    if (src_first == src_second) {
++        ff_d3d11_copy_frame_to_frame(ctx->context, src_first, dst);
++        ret = 0;
++        goto exit;
++    }
++
++    if ((ret = ivtc_d3d11_frame_srvs(avctx, src_first,  0, &srvs[0], &srvs[2])) < 0 ||
++        (ret = ivtc_d3d11_frame_srvs(avctx, src_second, 1, &srvs[1], &srvs[3])) < 0 ||
++        (ret = ivtc_d3d11_output_uavs(avctx, dst, uavs, &direct)) < 0 ||
++        (ret = ivtc_d3d11_set_params(avctx, &params)) < 0)
++        goto exit;
++
++    ivtc_d3d11_dispatch(ctx, ctx->cs_weave_y, srvs, BUF_NB, 2, uavs,
++                        DIV_UP(s->luma_w, IVTC_WG), DIV_UP(s->luma_h, IVTC_WG));
++    ivtc_d3d11_dispatch(ctx, ctx->cs_weave_uv, srvs, BUF_NB, 2, uavs,
++                        DIV_UP((s->luma_w + 1) >> 1, IVTC_WG),
++                        DIV_UP((s->luma_h + 1) >> 1, IVTC_WG));
++    if (!direct)
++        ff_d3d11_copy_texture_to_frame(ctx->context, ctx->work_tex, dst);
++
++exit:
++    ivtc_d3d11_release_views(srvs, 4);
++    FF_D3D11_RELEASE(uavs[0]);
++    FF_D3D11_RELEASE(uavs[1]);
++    ivtc_d3d11_unlock(ctx);
++    return ret;
++}
++
++// ivtc_diff emits one abs-diff sum per 16x16 group into its slice; all
++// dispatches are enqueued first, then ONE blocking read of the whole buffer.
++static int ivtc_d3d11_diff_cycle(AVFilterContext *avctx, AVFrame *const a[IVTC_CYCLE],
++                                 AVFrame *const b[IVTC_CYCLE], const float **sums, int *stride)
++{
++    IvtcD3D11Context *ctx = avctx->priv;
++    IVTCContext *s = &ctx->ivtc;
++    IvtcD3D11Params params = {
++        .width  = s->luma_w,
++        .height = s->luma_h,
++        .nbx    = s->nwgx,
++        .scale  = ctx->scale_diff,
++        .maxval = ctx->maxval,
++    };
++    int ret = 0, i;
++
++    ivtc_d3d11_lock(ctx);
++    for (i = 0; i < IVTC_CYCLE; i++) {
++        ID3D11ShaderResourceView *srvs[4] = { NULL };
++        if (!b[i])
++            continue;
++        params.out_offset = i * s->nwg;
++        if ((ret = ivtc_d3d11_frame_srvs(avctx, a[i], 0, &srvs[0], NULL)) >= 0 &&
++            (ret = ivtc_d3d11_frame_srvs(avctx, b[i], 1, &srvs[1], NULL)) >= 0 &&
++            (ret = ivtc_d3d11_set_params(avctx, &params)) >= 0)
++            ivtc_d3d11_dispatch(ctx, ctx->cs_diff, srvs, 0, BUF_NB, ctx->buf_uavs,
++                                s->nwgx, s->nwgy);
++        ivtc_d3d11_release_views(srvs, 4);
++        if (ret < 0)
++            goto exit;
++    }
++    ret = ivtc_d3d11_readback(avctx, ctx->bufs[BUF_DIFF], ctx->diff_staging, ctx->diff_host,
++                              (size_t)s->nwg * IVTC_CYCLE * sizeof(float));
++    if (ret < 0)
++        goto exit;
++
++    *sums   = ctx->diff_host;
++    *stride = s->nwg;
++
++exit:
++    ivtc_d3d11_unlock(ctx);
++    return ret;
++}
++
++// ---- filter plumbing ------------------------------------------------------
++
++static int ivtc_config_input(AVFilterLink *inlink)
++{
++    FilterLink          *l = ff_filter_link(inlink);
++    AVFilterContext *avctx = inlink->dst;
++    IvtcD3D11Context  *ctx = avctx->priv;
++
++    if (!l->hw_frames_ctx) {
++        av_log(avctx, AV_LOG_ERROR, "ivtc_d3d11 requires a D3D11 hardware frames "
++               "context on the input (decode with -hwaccel_output_format d3d11, "
++               "or insert hwupload).\n");
++        return AVERROR(EINVAL);
++    }
++
++    av_buffer_unref(&ctx->input_frames_ref);
++    ctx->input_frames_ref = av_buffer_ref(l->hw_frames_ctx);
++    if (!ctx->input_frames_ref)
++        return AVERROR(ENOMEM);
++    ctx->input_frames = (AVHWFramesContext*)ctx->input_frames_ref->data;
++    if (ctx->input_frames->format != AV_PIX_FMT_D3D11)
++        return AVERROR(EINVAL);
++    if (ctx->input_frames->sw_format != AV_PIX_FMT_NV12 &&
++        ctx->input_frames->sw_format != AV_PIX_FMT_P010) {
++        av_log(avctx, AV_LOG_ERROR, "ivtc_d3d11 supports NV12 and P010 only, got %s\n",
++               av_get_pix_fmt_name(ctx->input_frames->sw_format));
++        return AVERROR(ENOSYS);
++    }
++
++    av_log(avctx, AV_LOG_INFO, "ivtc_d3d11: %dx%d sw_format %s.\n",
++           inlink->w, inlink->h, av_get_pix_fmt_name(ctx->input_frames->sw_format));
++    return 0;
++}
++
++static int ivtc_probe_output_uav(AVFilterContext *avctx, AVBufferRef *frames_ref)
++{
++    IvtcD3D11Context *ctx = avctx->priv;
++    ID3D11UnorderedAccessView *uavs[2] = { NULL };
++    AVFrame *frame = av_frame_alloc();
++    int ret;
++
++    if (!frame)
++        return AVERROR(ENOMEM);
++    ret = av_hwframe_get_buffer(frames_ref, frame, 0);
++    if (ret >= 0) {
++        ID3D11Texture2D *tex = (ID3D11Texture2D *)frame->data[0];
++        UINT sub = (UINT)(uintptr_t)frame->data[1];
++        ret = ff_d3d11_create_uav(avctx, ctx->device, tex, sub,
++                                  ff_d3d11_plane_format(ctx->sw_format, 0),
++                                  AV_LOG_DEBUG, "ivtc", &uavs[0]);
++        if (ret >= 0)
++            ret = ff_d3d11_create_uav(avctx, ctx->device, tex, sub,
++                                      ff_d3d11_plane_format(ctx->sw_format, 1),
++                                      AV_LOG_DEBUG, "ivtc", &uavs[1]);
++    }
++    FF_D3D11_RELEASE(uavs[0]);
++    FF_D3D11_RELEASE(uavs[1]);
++    av_frame_free(&frame);
++    return ret;
++}
++
++static int ivtc_config_output(AVFilterLink *outlink)
++{
++    FilterLink           *l = ff_filter_link(outlink);
++    AVFilterContext  *avctx = outlink->src;
++    AVFilterLink    *inlink = avctx->inputs[0];
++    IvtcD3D11Context   *ctx = avctx->priv;
++    // output pool bind flags, most capable first: direct UAV weave (only with
++    // force_output_copy=0), then shader-readable for the decimation diff
++    static const UINT bind_flags[] = {
++        D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE |
++            D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_VIDEO_ENCODER,
++        D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_VIDEO_ENCODER,
++        D3D11_BIND_RENDER_TARGET | D3D11_BIND_VIDEO_ENCODER,
++    };
++    const AVPixFmtDescriptor *desc;
++    AVHWFramesContext *output_frames;
++    int ret = AVERROR(EINVAL), i;
++
++    av_assert0(ctx->input_frames);
++    ctx->sw_format  = ctx->input_frames->sw_format;
++    ctx->tex_format = ff_d3d11_texture_format(ctx->sw_format);
++
++    // luma scale for the shaders: same values as ivtc_cuda, applied to the
++    // whole container integer recovered from the UNORM read
++    desc = av_pix_fmt_desc_get(ctx->sw_format);
++    {
++        double maxval = (double)((1 << (desc->comp[0].depth + desc->comp[0].shift)) - 1);
++        ctx->maxval     = (float)maxval;
++        ctx->scale_fm   = (float)(255.0 / maxval);
++        ctx->scale_diff = (float)(1.0 / maxval);
++    }
++
++    av_buffer_unref(&ctx->device_ref);
++    ctx->device_ref = av_buffer_ref(ctx->input_frames->device_ref);
++    if (!ctx->device_ref)
++        return AVERROR(ENOMEM);
++    ctx->hwctx   = ((AVHWDeviceContext*)ctx->device_ref->data)->hwctx;
++    ctx->device  = ctx->hwctx->device;
++    ctx->context = ctx->hwctx->device_context;
++
++    ctx->direct_srv[0] = ctx->direct_srv[1] = -1;
++    ctx->direct_output_uav = 0;
++
++    // own fixed-size output pool (same device / sw_format), so the woven
++    // frames can go straight to the encoder or be derived to QSV
++    for (i = ctx->force_output_copy ? 1 : 0; i < FF_ARRAY_ELEMS(bind_flags); i++) {
++        av_buffer_unref(&l->hw_frames_ctx);
++        l->hw_frames_ctx = av_hwframe_ctx_alloc(ctx->device_ref);
++        if (!l->hw_frames_ctx)
++            return AVERROR(ENOMEM);
++        output_frames = (AVHWFramesContext*)l->hw_frames_ctx->data;
++        output_frames->format    = AV_PIX_FMT_D3D11;
++        output_frames->sw_format = ctx->sw_format;
++        output_frames->width     = inlink->w;
++        output_frames->height    = inlink->h;
++        output_frames->initial_pool_size = IVTC_D3D11_POOL_SIZE;
++        ((AVD3D11VAFramesContext *)output_frames->hwctx)->BindFlags = bind_flags[i];
++
++        if ((ret = ff_filter_init_hw_frames(avctx, outlink, IVTC_D3D11_POOL_SIZE)) < 0)
++            return ret;
++        ret = av_hwframe_ctx_init(l->hw_frames_ctx);
++        if (ret >= 0 && i == 0) {
++            ctx->output_frames = output_frames;
++            ret = ivtc_probe_output_uav(avctx, l->hw_frames_ctx);
++            ctx->direct_output_uav = ret >= 0;
++        }
++        if (ret >= 0)
++            break;
++        av_log(avctx, AV_LOG_DEBUG, "D3D11 output pool with bind flags 0x%x rejected\n",
++               bind_flags[i]);
++    }
++    if (ret < 0) {
++        av_buffer_unref(&l->hw_frames_ctx);
++        av_log(avctx, AV_LOG_ERROR, "Failed to initialise D3D11 frame "
++               "context for output: %d\n", ret);
++        return ret;
++    }
++    ctx->output_frames = (AVHWFramesContext*)l->hw_frames_ctx->data;
++    av_log(avctx, AV_LOG_DEBUG, "D3D11 shader output: %s\n",
++           ctx->direct_output_uav ? "direct UAV" : "copied from internal UAV texture");
++
++    outlink->w = inlink->w;
++    outlink->h = inlink->h;
++    return ff_ivtc_config_output_common(outlink);
++}
++
++static int ivtc_init(AVFilterContext *avctx)
++{
++    IvtcD3D11Context *ctx = avctx->priv;
++    IVTCContext *s = &ctx->ivtc;
++
++    ff_ivtc_init_common(avctx);
++    s->init        = ivtc_init_d3d11;
++    s->match_accum = ivtc_d3d11_match_accum;
++    s->synth       = ivtc_d3d11_synth;
++    s->diff_cycle  = ivtc_d3d11_diff_cycle;
++    s->sync        = ivtc_d3d11_sync;
++    return 0;
++}
++
++static av_cold void ivtc_uninit(AVFilterContext *avctx)
++{
++    IvtcD3D11Context *ctx = avctx->priv;
++    int i;
++
++    ff_ivtc_uninit_common(avctx);
++
++    FF_D3D11_RELEASE(ctx->cs_absdiff);
++    FF_D3D11_RELEASE(ctx->cs_diffmap);
++    FF_D3D11_RELEASE(ctx->cs_compare);
++    FF_D3D11_RELEASE(ctx->cs_diff);
++    FF_D3D11_RELEASE(ctx->cs_weave_y);
++    FF_D3D11_RELEASE(ctx->cs_weave_uv);
++    FF_D3D11_RELEASE(ctx->params_buf);
++    for (i = 0; i < BUF_NB; i++) {
++        FF_D3D11_RELEASE(ctx->buf_uavs[i]);
++        FF_D3D11_RELEASE(ctx->bufs[i]);
++    }
++    FF_D3D11_RELEASE(ctx->cmp_staging);
++    FF_D3D11_RELEASE(ctx->diff_staging);
++    FF_D3D11_RELEASE(ctx->event);
++    for (i = 0; i < IVTC_D3D11_NB_SCRATCH; i++)
++        FF_D3D11_RELEASE(ctx->scratch[i]);
++    FF_D3D11_RELEASE(ctx->work_tex);
++    av_freep(&ctx->cmp_host);
++    av_freep(&ctx->diff_host);
++    ff_d3d11_unload_shader_compiler(&ctx->d3dcompiler, &ctx->D3DCompile);
++
++    av_buffer_unref(&ctx->device_ref);
++    ctx->hwctx   = NULL;
++    ctx->device  = NULL;
++    ctx->context = NULL;
++    av_buffer_unref(&ctx->input_frames_ref);
++    ctx->input_frames  = NULL;
++    ctx->output_frames = NULL;
++}
++
++#define OFFSET(x) offsetof(IvtcD3D11Context, x)
++
++static const AVOption ivtc_d3d11_options[] = {
++    IVTC_COMMON_OPTIONS
++    { "force_output_copy", "Force output through an internal unordered-access texture",
++      OFFSET(force_output_copy), AV_OPT_TYPE_BOOL, { .i64 = 1 }, 0, 1, IVTC_FLAGS },
++    { NULL }
++};
++
++AVFILTER_DEFINE_CLASS(ivtc_d3d11);
++
++static const AVFilterPad ivtc_d3d11_inputs[] = {
++    {
++        .name         = "default",
++        .type         = AVMEDIA_TYPE_VIDEO,
++        .config_props = &ivtc_config_input,
++    },
++};
++
++static const AVFilterPad ivtc_d3d11_outputs[] = {
++    {
++        .name         = "default",
++        .type         = AVMEDIA_TYPE_VIDEO,
++        .config_props = &ivtc_config_output,
++    },
++};
++
++const FFFilter ff_vf_ivtc_d3d11 = {
++    .p.name         = "ivtc_d3d11",
++    .p.description  = NULL_IF_CONFIG_SMALL("Inverse telecine (field matching) through D3D11."),
++    .p.priv_class   = &ivtc_d3d11_class,
++    .p.flags        = AVFILTER_FLAG_HWDEVICE,
++    .priv_size      = sizeof(IvtcD3D11Context),
++    .init           = &ivtc_init,
++    .uninit         = &ivtc_uninit,
++    .activate       = &ff_ivtc_activate,
++    FILTER_INPUTS(ivtc_d3d11_inputs),
++    FILTER_OUTPUTS(ivtc_d3d11_outputs),
++    FILTER_SINGLE_PIXFMT(AV_PIX_FMT_D3D11),
++    .flags_internal = FF_FILTER_FLAG_HWFRAME_AWARE,
++};

@@ -74,4 +74,4 @@ upstream (lean simply filters out the HWA-specific `--enable-*`).
 builder image.
 
 ## Credit
-- vf_ivtc_opencl, vf_ivtc_cuda (ivtc_common): From [QSVEnc](https://github.com/rigaya/QSVEnc) under MIT License by rigaya.
+- vf_ivtc_opencl, vf_ivtc_cuda, vf_ivtc_d3d11 (ivtc_common): From [QSVEnc](https://github.com/rigaya/QSVEnc) under MIT License by rigaya.
