@@ -1,0 +1,268 @@
+yadif_d3d11, bwdif_d3d11: support P010 input
+
+The D3D11 deinterlacers rejected everything but NV12 and hard-coded NV12 for
+their internal textures and SRV/UAV plane views. Take the texture and plane
+formats from the input sw_format instead (R16/R16G16 UNORM views for P010).
+
+yadif's spatial-check bias of one sample LSB was hard-coded as 1/255 in the
+shader; pass it in the constant buffer, derived from the format's depth and
+shift (1/255 for NV12, unchanged; 64/65535 for P010). The parameter struct is
+padded to 48 bytes, as constant buffer sizes must be multiples of 16. The bwdif
+math is depth-independent (ratios over 8192, clamped to [0,1]).
+
+Every output pool fallback requested D3D11_BIND_VIDEO_ENCODER, which NVIDIA
+rejects for P010 textures (E_INVALIDARG), leaving no usable pool. Try the
+encoder-bindable pools first as before, then the same bind flags without
+VIDEO_ENCODER.
+
+--- a/libavfilter/vf_yadif_d3d11.c
++++ b/libavfilter/vf_yadif_d3d11.c
+@@ -53,6 +53,8 @@
+     int current_field;
+     int skip_spatial_check;
+     int algorithm;
++    float pixel_step;   // one sample LSB in UNORM units (yadif spatial bias)
++    int pad[3];         // constant buffer size must be a multiple of 16
+ } DeintD3D11Params;
+ 
+ typedef struct DeintD3D11Context {
+@@ -64,6 +66,8 @@
+     AVBufferRef *device_ref;
+     AVBufferRef *input_frames_ref;
+     AVHWFramesContext *input_frames;
++    enum AVPixelFormat sw_format;
++    float pixel_step;
+ 
+     ID3D11Device *device;
+     ID3D11DeviceContext *context;
+@@ -143,7 +147,7 @@
+     desc.Height = h;
+     desc.MipLevels = 1;
+     desc.ArraySize = 1;
+-    desc.Format = DXGI_FORMAT_NV12;
++    desc.Format = ff_d3d11_texture_format(s->sw_format);
+     desc.SampleDesc.Count = 1;
+     desc.Usage = D3D11_USAGE_DEFAULT;
+     desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+@@ -169,38 +173,38 @@
+     return AVERROR_EXTERNAL;
+ }
+ 
+-static int create_nv12_srv_view(AVFilterContext *ctx, ID3D11Texture2D *tex,
+-                                UINT subresource, int plane, int log_level,
+-                                ID3D11ShaderResourceView **srv)
++static int create_plane_srv_view(AVFilterContext *ctx, ID3D11Texture2D *tex,
++                                 UINT subresource, int plane, int log_level,
++                                 ID3D11ShaderResourceView **srv)
+ {
+     DeintD3D11Context *s = ctx->priv;
+ 
+     return ff_d3d11_create_srv(ctx, s->device, tex, subresource,
+-                               ff_d3d11_plane_format(AV_PIX_FMT_NV12, plane),
++                               ff_d3d11_plane_format(s->sw_format, plane),
+                                log_level, "D3D11 deinterlace", srv);
+ }
+ 
+-static int create_nv12_srv(AVFilterContext *ctx, ID3D11Texture2D *tex, int plane,
+-                           ID3D11ShaderResourceView **srv)
++static int create_plane_srv(AVFilterContext *ctx, ID3D11Texture2D *tex, int plane,
++                            ID3D11ShaderResourceView **srv)
+ {
+-    return create_nv12_srv_view(ctx, tex, 0, plane, AV_LOG_ERROR, srv);
++    return create_plane_srv_view(ctx, tex, 0, plane, AV_LOG_ERROR, srv);
+ }
+ 
+-static int create_nv12_uav_view(AVFilterContext *ctx, ID3D11Texture2D *tex,
+-                                UINT subresource, int plane, int log_level,
+-                                ID3D11UnorderedAccessView **uav)
++static int create_plane_uav_view(AVFilterContext *ctx, ID3D11Texture2D *tex,
++                                 UINT subresource, int plane, int log_level,
++                                 ID3D11UnorderedAccessView **uav)
+ {
+     DeintD3D11Context *s = ctx->priv;
+ 
+     return ff_d3d11_create_uav(ctx, s->device, tex, subresource,
+-                               ff_d3d11_plane_format(AV_PIX_FMT_NV12, plane),
++                               ff_d3d11_plane_format(s->sw_format, plane),
+                                log_level, "D3D11 deinterlace", uav);
+ }
+ 
+-static int create_nv12_uav(AVFilterContext *ctx, ID3D11Texture2D *tex, int plane,
+-                           ID3D11UnorderedAccessView **uav)
++static int create_plane_uav(AVFilterContext *ctx, ID3D11Texture2D *tex, int plane,
++                            ID3D11UnorderedAccessView **uav)
+ {
+-    return create_nv12_uav_view(ctx, tex, 0, plane, AV_LOG_ERROR, uav);
++    return create_plane_uav_view(ctx, tex, 0, plane, AV_LOG_ERROR, uav);
+ }
+ 
+ static int create_frame_srvs(AVFilterContext *ctx, AVFrame *frame,
+@@ -211,10 +215,10 @@
+     UINT subresource = (UINT)(uintptr_t)frame->data[1];
+     int ret;
+ 
+-    ret = create_nv12_srv_view(ctx, tex, subresource, 0, AV_LOG_DEBUG, srv_y);
++    ret = create_plane_srv_view(ctx, tex, subresource, 0, AV_LOG_DEBUG, srv_y);
+     if (ret < 0)
+         return ret;
+-    ret = create_nv12_srv_view(ctx, tex, subresource, 1, AV_LOG_DEBUG, srv_uv);
++    ret = create_plane_srv_view(ctx, tex, subresource, 1, AV_LOG_DEBUG, srv_uv);
+     if (ret < 0)
+         FF_D3D11_RELEASE(*srv_y);
+     return ret;
+@@ -250,7 +254,7 @@
+     ff_d3d11_copy_frame_to_texture(s->context, y->cur,  s->cur_tex);
+     ff_d3d11_copy_frame_to_texture(s->context, y->next, s->next_tex);
+ 
+-#define MAKE_SRV(tex, plane, idx) do { ret = create_nv12_srv(ctx, tex, plane, &srvs[idx]); if (ret < 0) goto fail; } while (0)
++#define MAKE_SRV(tex, plane, idx) do { ret = create_plane_srv(ctx, tex, plane, &srvs[idx]); if (ret < 0) goto fail; } while (0)
+     MAKE_SRV(s->prev_tex, 0, 0);
+     MAKE_SRV(s->cur_tex,  0, 1);
+     MAKE_SRV(s->next_tex, 0, 2);
+@@ -278,9 +282,9 @@
+ 
+     *direct = 0;
+     if (s->direct_output_uav) {
+-        ret = create_nv12_uav_view(ctx, tex, subresource, 0, AV_LOG_DEBUG, &uavs[0]);
++        ret = create_plane_uav_view(ctx, tex, subresource, 0, AV_LOG_DEBUG, &uavs[0]);
+         if (ret >= 0)
+-            ret = create_nv12_uav_view(ctx, tex, subresource, 1, AV_LOG_DEBUG, &uavs[1]);
++            ret = create_plane_uav_view(ctx, tex, subresource, 1, AV_LOG_DEBUG, &uavs[1]);
+         if (ret >= 0) {
+             *direct = 1;
+             return 0;
+@@ -292,10 +296,10 @@
+         s->direct_output_uav = 0;
+     }
+ 
+-    ret = create_nv12_uav(ctx, s->work_tex, 0, &uavs[0]);
++    ret = create_plane_uav(ctx, s->work_tex, 0, &uavs[0]);
+     if (ret < 0)
+         return ret;
+-    ret = create_nv12_uav(ctx, s->work_tex, 1, &uavs[1]);
++    ret = create_plane_uav(ctx, s->work_tex, 1, &uavs[1]);
+     if (ret < 0)
+         FF_D3D11_RELEASE(uavs[0]);
+     return ret;
+@@ -327,9 +331,9 @@
+         subresource = (UINT)(uintptr_t)frame->data[1];
+     }
+ 
+-    ret = create_nv12_uav_view(ctx, tex, subresource, 0, AV_LOG_DEBUG, &uavs[0]);
++    ret = create_plane_uav_view(ctx, tex, subresource, 0, AV_LOG_DEBUG, &uavs[0]);
+     if (ret >= 0)
+-        ret = create_nv12_uav_view(ctx, tex, subresource, 1, AV_LOG_DEBUG, &uavs[1]);
++        ret = create_plane_uav_view(ctx, tex, subresource, 1, AV_LOG_DEBUG, &uavs[1]);
+ 
+ done:
+     FF_D3D11_RELEASE(uavs[0]);
+@@ -373,6 +377,8 @@
+     params.current_field = y->current_field;
+     params.skip_spatial_check = y->mode & 2;
+     params.algorithm = s->algorithm;
++    params.pixel_step = s->pixel_step;
++    memset(params.pad, 0, sizeof(params.pad));
+ 
+     hr = s->context->lpVtbl->Map(s->context, (ID3D11Resource *)s->params_buf,
+                                  0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
+@@ -461,23 +467,40 @@
+ 
+     if (s->input_frames->format != AV_PIX_FMT_D3D11)
+         return AVERROR(EINVAL);
+-    if (s->input_frames->sw_format != AV_PIX_FMT_NV12) {
+-        av_log(ctx, AV_LOG_ERROR, "D3D11 deinterlacing currently supports NV12 only, got %s\n",
++    if (s->input_frames->sw_format != AV_PIX_FMT_NV12 &&
++        s->input_frames->sw_format != AV_PIX_FMT_P010) {
++        av_log(ctx, AV_LOG_ERROR, "D3D11 deinterlacing currently supports NV12 and P010 only, got %s\n",
+                av_get_pix_fmt_name(s->input_frames->sw_format));
+         return AVERROR(ENOSYS);
+     }
++    s->sw_format = s->input_frames->sw_format;
++
++    {
++        // yadif's "-1" spatial bias is one sample LSB; P010 keeps 10 bits in
++        // the top of a 16-bit UNORM container
++        const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(s->sw_format);
++        int shift = desc->comp[0].shift;
++        s->pixel_step = (float)((1 << shift) / (double)((1 << (desc->comp[0].depth + shift)) - 1));
++    }
+ 
+     return 0;
+ }
+ 
+ static int config_output(AVFilterLink *link)
+ {
++    static const UINT output_bind_flags[] = {
++        D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE |
++            D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_VIDEO_ENCODER,
++        D3D11_BIND_RENDER_TARGET | D3D11_BIND_VIDEO_ENCODER,
++        D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS,
++        D3D11_BIND_RENDER_TARGET,
++    };
+     FilterLink *l = ff_filter_link(link);
+     AVHWFramesContext *output_frames;
+     AVFilterContext *ctx = link->src;
+     DeintD3D11Context *s = ctx->priv;
+     YADIFContext *y = &s->yadif;
+-    int ret;
++    int ret = AVERROR(EINVAL);
+ 
+     av_assert0(s->input_frames);
+ 
+@@ -493,7 +516,14 @@
+     s->direct_input_srv = -1;
+     s->direct_output_uav = -1;
+ 
+-    for (int direct = !s->force_output_copy; direct >= 0; direct--) {
++    // direct UAV pool first, then copy-target pool; the same again without
++    // VIDEO_ENCODER, which some drivers reject for 10-bit textures (NVIDIA P010)
++    for (int i = 0; i < FF_ARRAY_ELEMS(output_bind_flags); i++) {
++        int direct = !!(output_bind_flags[i] & D3D11_BIND_UNORDERED_ACCESS);
++
++        if (direct && s->force_output_copy)
++            continue;
++
+         l->hw_frames_ctx = av_hwframe_ctx_alloc(s->device_ref);
+         if (!l->hw_frames_ctx)
+             return AVERROR(ENOMEM);
+@@ -507,9 +537,7 @@
+ 
+         {
+             AVD3D11VAFramesContext *frames_hwctx = output_frames->hwctx;
+-            frames_hwctx->BindFlags = direct ? D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE |
+-                                                   D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_VIDEO_ENCODER
+-                                             : D3D11_BIND_RENDER_TARGET | D3D11_BIND_VIDEO_ENCODER;
++            frames_hwctx->BindFlags = output_bind_flags[i];
+         }
+ 
+         ret = av_hwframe_ctx_init(l->hw_frames_ctx);
+@@ -529,8 +557,8 @@
+         }
+ 
+         av_buffer_unref(&l->hw_frames_ctx);
+-        if (direct)
+-            av_log(ctx, AV_LOG_DEBUG, "D3D11 shader output: UAV encoder pool rejected, using internal UAV texture\n");
++        av_log(ctx, AV_LOG_DEBUG, "D3D11 output pool with bind flags 0x%x rejected\n",
++               output_bind_flags[i]);
+     }
+     if (ret < 0)
+         return ret;
+--- a/libavfilter/d3d11/deint.hlsl
++++ b/libavfilter/d3d11/deint.hlsl
+@@ -39,6 +39,7 @@
+     int current_field;
+     int skip_spatial_check;
+     int algorithm;
++    float pixel_step;
+ };
+ 
+ int clampi(int v, int lo, int hi)
+@@ -120,7 +121,7 @@
+                float h, float i, float j, float k, float l, float m, float n)
+ {
+     float spatial_pred  = (d + k) * 0.5;
+-    float spatial_score = abs(c - j) + abs(d - k) + abs(e - l) - (1.0 / 255.0);
++    float spatial_score = abs(c - j) + abs(d - k) + abs(e - l) - pixel_step;
+ 
+     float score = abs(b - k) + abs(c - l) + abs(d - m);
+     if (score < spatial_score) {

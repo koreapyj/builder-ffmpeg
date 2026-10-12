@@ -315,7 +315,7 @@
  #ifndef AVFILTER_IVTC_H
 --- /dev/null
 +++ b/libavfilter/vf_ivtc_d3d11.c
-@@ -0,0 +1,845 @@
+@@ -0,0 +1,854 @@
 +/*
 + * Copyright (c) 2026
 + *
@@ -990,12 +990,17 @@
 +    AVFilterLink    *inlink = avctx->inputs[0];
 +    IvtcD3D11Context   *ctx = avctx->priv;
 +    // output pool bind flags, most capable first: direct UAV weave (only with
-+    // force_output_copy=0), then shader-readable for the decimation diff
++    // force_output_copy=0), then shader-readable for the decimation diff; the
++    // same again without VIDEO_ENCODER, which some drivers reject for 10-bit
++    // textures (NVIDIA P010)
 +    static const UINT bind_flags[] = {
 +        D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE |
 +            D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_VIDEO_ENCODER,
 +        D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_VIDEO_ENCODER,
 +        D3D11_BIND_RENDER_TARGET | D3D11_BIND_VIDEO_ENCODER,
++        D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS,
++        D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE,
++        D3D11_BIND_RENDER_TARGET,
 +    };
 +    const AVPixFmtDescriptor *desc;
 +    AVHWFramesContext *output_frames;
@@ -1028,7 +1033,11 @@
 +
 +    // own fixed-size output pool (same device / sw_format), so the woven
 +    // frames can go straight to the encoder or be derived to QSV
-+    for (i = ctx->force_output_copy ? 1 : 0; i < FF_ARRAY_ELEMS(bind_flags); i++) {
++    for (i = 0; i < FF_ARRAY_ELEMS(bind_flags); i++) {
++        int uav = !!(bind_flags[i] & D3D11_BIND_UNORDERED_ACCESS);
++
++        if (uav && ctx->force_output_copy)
++            continue;
 +        av_buffer_unref(&l->hw_frames_ctx);
 +        l->hw_frames_ctx = av_hwframe_ctx_alloc(ctx->device_ref);
 +        if (!l->hw_frames_ctx)
@@ -1044,7 +1053,7 @@
 +        if ((ret = ff_filter_init_hw_frames(avctx, outlink, IVTC_D3D11_POOL_SIZE)) < 0)
 +            return ret;
 +        ret = av_hwframe_ctx_init(l->hw_frames_ctx);
-+        if (ret >= 0 && i == 0) {
++        if (ret >= 0 && uav) {
 +            ctx->output_frames = output_frames;
 +            ret = ivtc_probe_output_uav(avctx, l->hw_frames_ctx);
 +            ctx->direct_output_uav = ret >= 0;
