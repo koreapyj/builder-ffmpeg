@@ -67,7 +67,7 @@ upstream (lean simply filters out the HWA-specific `--enable-*`).
 
 ### Useful variables
 
-`FF_REF` (upstream tag, default `v8.1.3-1`), `FF_REPO`, `CODENAME` / `ARCH`
+`FF_REF` (upstream tag, default `v8.1.3-2`), `FF_REPO`, `CODENAME` / `ARCH`
 (default: same as host), `PROFILE`. Run `make help` for the full list.
 
 `make clean` removes the `./src/` workspace; `make clean-image` removes the
