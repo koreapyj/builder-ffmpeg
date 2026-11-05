@@ -1,0 +1,353 @@
+yadif_opencl, bwdif_opencl: never free the output frame on failure
+
+deint_opencl_filter() is the YADIFContext.filter callback. Its dst argument is
+yadif->out, which is owned by return_frame() in yadif_common.c: after the
+callback returns, return_frame() writes the frame's pts/duration, injects
+captions into it and passes it to ff_filter_frame(). The failure path freed dst
+with av_frame_free(&dst), which only cleared the callback's local copy, so a
+freed frame went downstream and the process crashed later while tearing it
+down (use-after-free). The callback returns void, so a failure cannot be
+reported to the caller; it must leave a valid frame in dst instead.
+
+On failure, copy the current input frame into dst plane by plane
+(clEnqueueCopyImage), so the frame goes out undeinterlaced. If that is
+impossible (no command queue, a NULL plane, a failed copy), log it and leave
+dst as is: a one-frame glitch is acceptable, a crash is not.
+
+The check for NULL planes in dst/prev/cur/next failed silently. Log which
+frame and plane is NULL, with the frame's format, size and whether
+hw_frames_ctx is set. Failure logs are rate-limited to the first 10 failures,
+then every 1000th.
+
+deint_opencl_kernel_init() released the command queue and kernel on failure
+without clearing them, so the failure path ran clFinish() on a released queue,
+uninit released them a second time, and the retry on the next frame leaked
+the program. Clear all three handles after releasing them.
+--- a/libavfilter/vf_bwdif_opencl.c
++++ b/libavfilter/vf_bwdif_opencl.c
+@@ -39,8 +39,13 @@ typedef struct DeintOpenCLContext {
+     cl_kernel        kernel;
+ 
+     int initialised;
++    unsigned int nb_failures;
+ } DeintOpenCLContext;
+ 
++// Log the first DEINT_LOG_FIRST failures, then every DEINT_LOG_EVERY-th.
++#define DEINT_LOG_FIRST 10
++#define DEINT_LOG_EVERY 1000
++
+ static int deint_opencl_kernel_init(AVFilterContext *avctx)
+ {
+     DeintOpenCLContext *ctx = avctx->priv;
+@@ -71,13 +76,117 @@ static int deint_opencl_kernel_init(AVFi
+     return 0;
+ 
+ fail:
+-    if (ctx->command_queue)
+-        clReleaseCommandQueue(ctx->command_queue);
+-    if (ctx->kernel)
++    if (ctx->kernel) {
+         clReleaseKernel(ctx->kernel);
++        ctx->kernel = NULL;
++    }
++    if (ctx->command_queue) {
++        clReleaseCommandQueue(ctx->command_queue);
++        ctx->command_queue = NULL;
++    }
++    if (ctx->ocf.program) {
++        clReleaseProgram(ctx->ocf.program);
++        ctx->ocf.program = NULL;
++    }
+     return err;
+ }
+ 
++static int deint_opencl_log_due(const DeintOpenCLContext *ctx)
++{
++    return ctx->nb_failures < DEINT_LOG_FIRST ||
++           !(ctx->nb_failures % DEINT_LOG_EVERY);
++}
++
++static int deint_opencl_check_plane(AVFilterContext *avctx, const char *name,
++                                    const AVFrame *frame, int plane)
++{
++    DeintOpenCLContext *ctx = avctx->priv;
++    const char *fmt;
++
++    if (frame->data[plane])
++        return 0;
++
++    if (deint_opencl_log_due(ctx)) {
++        fmt = av_get_pix_fmt_name(frame->format);
++        av_log(avctx, AV_LOG_ERROR, "Plane %d of %s frame is NULL "
++               "(format %s, %dx%d, hw_frames_ctx %s, failure #%u).\n",
++               plane, name, fmt ? fmt : "none", frame->width, frame->height,
++               frame->hw_frames_ctx ? "set" : "unset", ctx->nb_failures + 1);
++    }
++    return 1;
++}
++
++/**
++ * Fill dst with an undeinterlaced copy of the current frame after a failure,
++ * so that a valid frame still goes downstream. If that is impossible, dst is
++ * left as is: a glitched frame is acceptable, freeing it is not.
++ */
++static void deint_opencl_copy_cur(AVFilterContext *avctx, AVFrame *dst)
++{
++    DeintOpenCLContext *ctx = avctx->priv;
++    YADIFContext *y = &ctx->yadif;
++    int do_log = deint_opencl_log_due(ctx);
++    int nb_planes = av_pix_fmt_count_planes(av_pix_fmt_desc_get_id(y->csp));
++    size_t origin[3] = { 0, 0, 0 };
++    size_t region[3], dst_w, dst_h, src_w, src_h;
++    cl_mem src_image, dst_image;
++    cl_int cle;
++    int p;
++
++    if (!ctx->command_queue) {
++        if (do_log)
++            av_log(avctx, AV_LOG_ERROR, "No command queue, cannot copy the "
++                   "current frame; output frame left as is.\n");
++        return;
++    }
++
++    for (p = 0; p < nb_planes; p++) {
++        src_image = (cl_mem)y->cur->data[p];
++        dst_image = (cl_mem)dst->data[p];
++        if (!src_image || !dst_image) {
++            if (do_log)
++                av_log(avctx, AV_LOG_ERROR, "Plane %d of %s frame is NULL, "
++                       "cannot copy the current frame; output frame left "
++                       "as is.\n", p, src_image ? "dst" : "cur");
++            goto finish;
++        }
++
++        cle = clGetImageInfo(dst_image, CL_IMAGE_WIDTH,  sizeof(dst_w), &dst_w, NULL);
++        if (cle == CL_SUCCESS)
++            cle = clGetImageInfo(dst_image, CL_IMAGE_HEIGHT, sizeof(dst_h), &dst_h, NULL);
++        if (cle == CL_SUCCESS)
++            cle = clGetImageInfo(src_image, CL_IMAGE_WIDTH,  sizeof(src_w), &src_w, NULL);
++        if (cle == CL_SUCCESS)
++            cle = clGetImageInfo(src_image, CL_IMAGE_HEIGHT, sizeof(src_h), &src_h, NULL);
++        if (cle != CL_SUCCESS) {
++            if (do_log)
++                av_log(avctx, AV_LOG_ERROR, "Failed to query plane %d size: "
++                       "%d; output frame left as is.\n", p, cle);
++            goto finish;
++        }
++
++        region[0] = FFMIN(dst_w, src_w);
++        region[1] = FFMIN(dst_h, src_h);
++        region[2] = 1;
++        cle = clEnqueueCopyImage(ctx->command_queue, src_image, dst_image,
++                                 origin, origin, region, 0, NULL, NULL);
++        if (cle != CL_SUCCESS) {
++            if (do_log)
++                av_log(avctx, AV_LOG_ERROR, "Failed to copy plane %d: %d; "
++                       "output frame left as is.\n", p, cle);
++            goto finish;
++        }
++    }
++
++    if (do_log)
++        av_log(avctx, AV_LOG_WARNING, "Deinterlacing failed, passing the "
++               "current frame through undeinterlaced (failure #%u).\n",
++               ctx->nb_failures + 1);
++
++finish:
++    clFinish(ctx->command_queue);
++}
++
+ static void deint_opencl_filter(AVFilterContext *avctx, AVFrame *dst,
+                                 int parity, int tff)
+ {
+@@ -116,7 +225,11 @@ static void deint_opencl_filter(AVFilter
+                "Deinterlacing plane %d: pixel_size: %d channels: %d\n",
+                comp->plane, pixel_size, channels);
+ 
+-        if (!dst->data[i] || !y->prev->data[i] || !y->cur->data[i] || !y->next->data[i]) {
++        // Bitwise OR so that every NULL plane gets logged, not just the first.
++        if (deint_opencl_check_plane(avctx, "dst",  dst,     i) |
++            deint_opencl_check_plane(avctx, "prev", y->prev, i) |
++            deint_opencl_check_plane(avctx, "cur",  y->cur,  i) |
++            deint_opencl_check_plane(avctx, "next", y->next, i)) {
+             err = AVERROR(EIO);
+             goto fail;
+         }
+@@ -147,9 +260,10 @@ static void deint_opencl_filter(AVFilter
+     return;
+ 
+ fail:
+-    clFinish(ctx->command_queue);
+-    av_frame_free(&dst);
+-    return;
++    // dst is yadif->out, which return_frame() keeps using and sends
++    // downstream after this callback returns; it must never be freed here.
++    deint_opencl_copy_cur(avctx, dst);
++    ctx->nb_failures++;
+ }
+ 
+ static int deint_opencl_config_input(AVFilterLink *inlink)
+--- a/libavfilter/vf_yadif_opencl.c
++++ b/libavfilter/vf_yadif_opencl.c
+@@ -39,8 +39,13 @@ typedef struct DeintOpenCLContext {
+     cl_kernel        kernel;
+ 
+     int initialised;
++    unsigned int nb_failures;
+ } DeintOpenCLContext;
+ 
++// Log the first DEINT_LOG_FIRST failures, then every DEINT_LOG_EVERY-th.
++#define DEINT_LOG_FIRST 10
++#define DEINT_LOG_EVERY 1000
++
+ static int deint_opencl_kernel_init(AVFilterContext *avctx)
+ {
+     DeintOpenCLContext *ctx = avctx->priv;
+@@ -71,13 +76,117 @@ static int deint_opencl_kernel_init(AVFi
+     return 0;
+ 
+ fail:
+-    if (ctx->command_queue)
+-        clReleaseCommandQueue(ctx->command_queue);
+-    if (ctx->kernel)
++    if (ctx->kernel) {
+         clReleaseKernel(ctx->kernel);
++        ctx->kernel = NULL;
++    }
++    if (ctx->command_queue) {
++        clReleaseCommandQueue(ctx->command_queue);
++        ctx->command_queue = NULL;
++    }
++    if (ctx->ocf.program) {
++        clReleaseProgram(ctx->ocf.program);
++        ctx->ocf.program = NULL;
++    }
+     return err;
+ }
+ 
++static int deint_opencl_log_due(const DeintOpenCLContext *ctx)
++{
++    return ctx->nb_failures < DEINT_LOG_FIRST ||
++           !(ctx->nb_failures % DEINT_LOG_EVERY);
++}
++
++static int deint_opencl_check_plane(AVFilterContext *avctx, const char *name,
++                                    const AVFrame *frame, int plane)
++{
++    DeintOpenCLContext *ctx = avctx->priv;
++    const char *fmt;
++
++    if (frame->data[plane])
++        return 0;
++
++    if (deint_opencl_log_due(ctx)) {
++        fmt = av_get_pix_fmt_name(frame->format);
++        av_log(avctx, AV_LOG_ERROR, "Plane %d of %s frame is NULL "
++               "(format %s, %dx%d, hw_frames_ctx %s, failure #%u).\n",
++               plane, name, fmt ? fmt : "none", frame->width, frame->height,
++               frame->hw_frames_ctx ? "set" : "unset", ctx->nb_failures + 1);
++    }
++    return 1;
++}
++
++/**
++ * Fill dst with an undeinterlaced copy of the current frame after a failure,
++ * so that a valid frame still goes downstream. If that is impossible, dst is
++ * left as is: a glitched frame is acceptable, freeing it is not.
++ */
++static void deint_opencl_copy_cur(AVFilterContext *avctx, AVFrame *dst)
++{
++    DeintOpenCLContext *ctx = avctx->priv;
++    YADIFContext *y = &ctx->yadif;
++    int do_log = deint_opencl_log_due(ctx);
++    int nb_planes = av_pix_fmt_count_planes(av_pix_fmt_desc_get_id(y->csp));
++    size_t origin[3] = { 0, 0, 0 };
++    size_t region[3], dst_w, dst_h, src_w, src_h;
++    cl_mem src_image, dst_image;
++    cl_int cle;
++    int p;
++
++    if (!ctx->command_queue) {
++        if (do_log)
++            av_log(avctx, AV_LOG_ERROR, "No command queue, cannot copy the "
++                   "current frame; output frame left as is.\n");
++        return;
++    }
++
++    for (p = 0; p < nb_planes; p++) {
++        src_image = (cl_mem)y->cur->data[p];
++        dst_image = (cl_mem)dst->data[p];
++        if (!src_image || !dst_image) {
++            if (do_log)
++                av_log(avctx, AV_LOG_ERROR, "Plane %d of %s frame is NULL, "
++                       "cannot copy the current frame; output frame left "
++                       "as is.\n", p, src_image ? "dst" : "cur");
++            goto finish;
++        }
++
++        cle = clGetImageInfo(dst_image, CL_IMAGE_WIDTH,  sizeof(dst_w), &dst_w, NULL);
++        if (cle == CL_SUCCESS)
++            cle = clGetImageInfo(dst_image, CL_IMAGE_HEIGHT, sizeof(dst_h), &dst_h, NULL);
++        if (cle == CL_SUCCESS)
++            cle = clGetImageInfo(src_image, CL_IMAGE_WIDTH,  sizeof(src_w), &src_w, NULL);
++        if (cle == CL_SUCCESS)
++            cle = clGetImageInfo(src_image, CL_IMAGE_HEIGHT, sizeof(src_h), &src_h, NULL);
++        if (cle != CL_SUCCESS) {
++            if (do_log)
++                av_log(avctx, AV_LOG_ERROR, "Failed to query plane %d size: "
++                       "%d; output frame left as is.\n", p, cle);
++            goto finish;
++        }
++
++        region[0] = FFMIN(dst_w, src_w);
++        region[1] = FFMIN(dst_h, src_h);
++        region[2] = 1;
++        cle = clEnqueueCopyImage(ctx->command_queue, src_image, dst_image,
++                                 origin, origin, region, 0, NULL, NULL);
++        if (cle != CL_SUCCESS) {
++            if (do_log)
++                av_log(avctx, AV_LOG_ERROR, "Failed to copy plane %d: %d; "
++                       "output frame left as is.\n", p, cle);
++            goto finish;
++        }
++    }
++
++    if (do_log)
++        av_log(avctx, AV_LOG_WARNING, "Deinterlacing failed, passing the "
++               "current frame through undeinterlaced (failure #%u).\n",
++               ctx->nb_failures + 1);
++
++finish:
++    clFinish(ctx->command_queue);
++}
++
+ static void deint_opencl_filter(AVFilterContext *avctx, AVFrame *dst,
+                                 int parity, int tff)
+ {
+@@ -116,7 +225,11 @@ static void deint_opencl_filter(AVFilter
+                "Deinterlacing plane %d: pixel_size: %d channels: %d\n",
+                comp->plane, pixel_size, channels);
+ 
+-        if (!dst->data[i] || !y->prev->data[i] || !y->cur->data[i] || !y->next->data[i]) {
++        // Bitwise OR so that every NULL plane gets logged, not just the first.
++        if (deint_opencl_check_plane(avctx, "dst",  dst,     i) |
++            deint_opencl_check_plane(avctx, "prev", y->prev, i) |
++            deint_opencl_check_plane(avctx, "cur",  y->cur,  i) |
++            deint_opencl_check_plane(avctx, "next", y->next, i)) {
+             err = AVERROR(EIO);
+             goto fail;
+         }
+@@ -144,9 +257,10 @@ static void deint_opencl_filter(AVFilter
+     return;
+ 
+ fail:
+-    clFinish(ctx->command_queue);
+-    av_frame_free(&dst);
+-    return;
++    // dst is yadif->out, which return_frame() keeps using and sends
++    // downstream after this callback returns; it must never be freed here.
++    deint_opencl_copy_cur(avctx, dst);
++    ctx->nb_failures++;
+ }
+ 
+ static int deint_opencl_config_input(AVFilterLink *inlink)
