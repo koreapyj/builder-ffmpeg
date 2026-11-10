@@ -274,9 +274,18 @@
      else
 -        en->sub_filename[0] = '\0';
 +        en->sub_filename[0] = '\0';   /* independent ass rendition: segment is en->filename */
- 
+
      en->duration = duration;
      en->pos      = pos;
+@@ -1270,7 +1347,7 @@ static int parse_playlist(AVFormatContex
+                 }
+                 ff_format_set_url(vs->avf, new_file);
+
+-                if (vs->has_subtitle) {
++                if (vs->has_subtitle && vs->vtt_avf) {
+                     int vtt_index = extract_segment_number(line);
+                     const char *vtt_basename = av_basename(vs->vtt_basename);
+                     char *vtt_file = NULL;
 @@ -1443,10 +1520,47 @@ static int create_master_playlist(AVForm
          ff_hls_write_audio_rendition(hls->m3u8_out, vs->agroup, m3u8_rel_name, vs->language, i, hls->has_default_key ? vs->is_default : 1, nb_channels);
      }
