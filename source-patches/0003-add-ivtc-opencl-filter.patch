@@ -550,7 +550,7 @@ libavfilter/opencl_source.h.
 +};
 --- /dev/null
 +++ b/libavfilter/opencl/ivtc.cl
-@@ -0,0 +1,307 @@
+@@ -0,0 +1,227 @@
 +/*
 + * Copyright (c) 2026
 + *
@@ -597,90 +597,10 @@ libavfilter/opencl_source.h.
 + */
 +
 +#define IVTC_WG 16
-+#define IVTC_NCAND 5
 +
 +__constant sampler_t ivtc_samp = (CLK_NORMALIZED_COORDS_FALSE |
 +                                  CLK_ADDRESS_CLAMP_TO_EDGE   |
 +                                  CLK_FILTER_NEAREST);
-+
-+// One luma sample under candidate `match` (0=C,1=P,2=N,3=B,4=U) at (x,y).
-+static float ivtc_cand(__read_only image2d_t prev,
-+                       __read_only image2d_t cur,
-+                       __read_only image2d_t next,
-+                       int x, int y, int tff, int match)
-+{
-+    int first = ((y & 1) == (tff ? 0 : 1));   // first-field (top) row?
-+    int2 p = (int2)(x, y);
-+    // NB: OpenCL forbids selecting an image2d_t with ?: -- branch on the float result.
-+    switch (match) {
-+    case 1: return first ? read_imagef(cur,  ivtc_samp, p).x : read_imagef(prev, ivtc_samp, p).x; // P
-+    case 2: return first ? read_imagef(cur,  ivtc_samp, p).x : read_imagef(next, ivtc_samp, p).x; // N
-+    case 3: return first ? read_imagef(prev, ivtc_samp, p).x : read_imagef(cur,  ivtc_samp, p).x; // B
-+    case 4: return first ? read_imagef(next, ivtc_samp, p).x : read_imagef(cur,  ivtc_samp, p).x; // U
-+    default: return read_imagef(cur, ivtc_samp, p).x;                                             // C
-+    }
-+}
-+
-+/*
-+ * Score C/P/N combing on the luma plane as a motion-masked combing *energy*
-+ * (not a binary combed-pixel count). For a second-field row that is a same-sign
-+ * vertical extremum between its two preserved-parity neighbours, the combing
-+ * strength is the SMALLER of the two excursions, min(|d0|,|d2|): a real comb
-+ * spikes both sides, while an edge/gradient leaves one side ~0 and is therefore
-+ * masked out (the `lo > thresh` gate). Accumulating that graded energy -- rather
-+ * than counting pixels over a threshold -- separates near-tie candidates on
-+ * limited-animation frames, where a binary count is dominated by noise and makes
-+ * the per-frame match flip (breaking the decimation cadence). This mirrors the
-+ * spirit of vf_fieldmatch's motion-masked metric while staying a single-pass GPU
-+ * reduction. Each work-group writes IVTC_NCAND partial energies to
-+ * scores[wg*IVTC_NCAND + m]; the host sums across work-groups and picks the
-+ * lowest-energy candidate.
-+ */
-+// args: 0=prev 1=cur 2=next 3=width 4=height 5=tff 6=thresh 7=scores
-+__attribute__((reqd_work_group_size(IVTC_WG, IVTC_WG, 1)))
-+__kernel void ivtc_score(__read_only image2d_t prev,
-+                         __read_only image2d_t cur,
-+                         __read_only image2d_t next,
-+                         int width, int height, int tff, float thresh,
-+                         __global float *scores)
-+{
-+    int x   = get_global_id(0);
-+    int y   = get_global_id(1);
-+    int tid = get_local_id(1) * IVTC_WG + get_local_id(0);
-+    int first_parity = tff ? 0 : 1;
-+    int m;
-+
-+    float e[IVTC_NCAND];
-+    for (m = 0; m < IVTC_NCAND; m++) e[m] = 0.0f;
-+    if (x < width && (y & 1) == first_parity && (y + 2) < height) {
-+        for (m = 0; m < IVTC_NCAND; m++) {
-+            float v0 = ivtc_cand(prev, cur, next, x, y,     tff, m);
-+            float v1 = ivtc_cand(prev, cur, next, x, y + 1, tff, m);
-+            float v2 = ivtc_cand(prev, cur, next, x, y + 2, tff, m);
-+            float d0 = v1 - v0, d2 = v1 - v2;
-+            if ((d0 < 0.0f) == (d2 < 0.0f)) {           // same-sign extremum
-+                float lo = fmin(fabs(d0), fabs(d2));    // combing strength
-+                if (lo > thresh)                        // motion/comb gate
-+                    e[m] = lo;
-+            }
-+        }
-+    }
-+
-+    __local float l[IVTC_WG * IVTC_WG * IVTC_NCAND];
-+    for (m = 0; m < IVTC_NCAND; m++) l[tid * IVTC_NCAND + m] = e[m];
-+    barrier(CLK_LOCAL_MEM_FENCE);
-+    for (int s = (IVTC_WG * IVTC_WG) / 2; s > 0; s >>= 1) {
-+        if (tid < s)
-+            for (m = 0; m < IVTC_NCAND; m++)
-+                l[tid * IVTC_NCAND + m] += l[(tid + s) * IVTC_NCAND + m];
-+        barrier(CLK_LOCAL_MEM_FENCE);
-+    }
-+    if (tid == 0) {
-+        int wg = get_group_id(1) * get_num_groups(0) + get_group_id(0);
-+        for (m = 0; m < IVTC_NCAND; m++)
-+            scores[wg * IVTC_NCAND + m] = l[m];
-+    }
-+}
 +
 +/*
 + * Synthesize the chosen field-match into dst. Works for any plane (luma R, or
@@ -870,7 +790,7 @@ libavfilter/opencl_source.h.
  extern const FFFilter ff_vf_lagfun;
 --- a/libavfilter/Makefile
 +++ b/libavfilter/Makefile
-@@ -375,6 +375,8 @@ OBJS-$(CONFIG_INFLATE_FILTER)
+@@ -377,6 +377,8 @@ OBJS-$(CONFIG_INFLATE_FILTER)
  OBJS-$(CONFIG_INTERLACE_FILTER)              += vf_tinterlace.o
  OBJS-$(CONFIG_INTERLACE_VULKAN_FILTER)       += vf_interlace_vulkan.o vulkan.o vulkan_filter.o
  OBJS-$(CONFIG_INTERLEAVE_FILTER)             += f_interleave.o
