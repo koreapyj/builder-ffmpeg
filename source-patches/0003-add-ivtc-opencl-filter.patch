@@ -10,7 +10,7 @@ Field matching is a faithful OpenCL port of vf_fieldmatch's compare_fields
 inter-field motion mask and the masked [1 4 1] combing energy on the GPU
 (opencl/ivtc.cl: fm_absdiff -> fm_diffmap = build_diff_map -> fm_compare_accum,
 all in 0..255 luma units so fieldmatch's integer thresholds apply unchanged),
-and a single readback brings back per-work-group accumulators; the host runs
+and a single readback brings back per-block integer accumulators; the host runs
 compare_fields' scalar tier decision (ivtc_decide). This GPU-accumulate /
 host-decide split keeps matching to ONE GPU<->CPU sync per frame. The chosen
 match is woven by ivtc_synthesize. Matched frames feed a 5-frame cycle;
@@ -77,7 +77,7 @@ libavfilter/opencl_source.h.
 
 --- /dev/null
 +++ b/libavfilter/vf_ivtc_opencl.c
-@@ -0,0 +1,460 @@
+@@ -0,0 +1,470 @@
 +/*
 + * Copyright (c) 2026
 + *
@@ -143,14 +143,15 @@ libavfilter/opencl_source.h.
 +    cl_kernel kernel_diffmap;     // fm_diffmap: build_diff_map flags
 +    cl_kernel kernel_compare;     // fm_compare_accum: compare_fields accumulators
 +
-+    cl_mem    diff_buf;           // per-WG luma SAD partials (IVTC_CYCLE slices of diff_stride floats)
++    cl_mem    diff_buf;           // per-block luma SAD sums (IVTC_CYCLE slices of diff_stride ints)
 +    cl_mem    diff_sub[IVTC_CYCLE]; // sub-buffer per slice of diff_buf
-+    int       diff_stride;        // floats between slices (aligned to MEM_BASE_ADDR_ALIGN)
++    int       diff_stride;        // ints between slices (aligned to MEM_BASE_ADDR_ALIGN)
 +    cl_mem    absdiff_buf;        // |cur-cand| per borrowed field row (w*hf uchar)
 +    cl_mem    flag_buf;           // build_diff_map flags (w*hf uchar)
-+    cl_mem    cmp_buf;            // per-WG compare_fields partials (nwg*6 float)
++    cl_mem    cmp_buf;            // per-block compare_fields sums (nwg*6 int)
 +    float    *diff_host;
-+    float    *cmp_host;
++    cl_int   *diff_int;
++    cl_int   *cmp_host;
 +    int       nb_planes;          // cached output plane count / dimensions
 +    size_t    plane_w[AV_NUM_DATA_POINTERS], plane_h[AV_NUM_DATA_POINTERS];
 +} IvtcOpenCLContext;
@@ -229,13 +230,14 @@ libavfilter/opencl_source.h.
 +    ctx->flag_buf = clCreateBuffer(ctx->ocf.hwctx->context, CL_MEM_READ_WRITE,
 +                                   (size_t)s->luma_w * s->luma_hf, NULL, &cle);
 +    if (!ctx->flag_buf) { av_log(avctx, AV_LOG_ERROR, "flag_buf: %d.\n", cle); return AVERROR(EIO); }
-+    ctx->cmp_buf = clCreateBuffer(ctx->ocf.hwctx->context, CL_MEM_WRITE_ONLY,
-+                                  s->nwg * 6 * sizeof(cl_float), NULL, &cle);
++    ctx->cmp_buf = clCreateBuffer(ctx->ocf.hwctx->context, CL_MEM_READ_WRITE,
++                                  s->nwg * 6 * sizeof(cl_int), NULL, &cle);
 +    if (!ctx->cmp_buf) { av_log(avctx, AV_LOG_ERROR, "cmp_buf: %d.\n", cle); return AVERROR(EIO); }
 +
 +    ctx->diff_host = av_calloc((size_t)ctx->diff_stride * IVTC_CYCLE, sizeof(float));
-+    ctx->cmp_host  = av_malloc_array(s->nwg, 6 * sizeof(float));
-+    if (!ctx->diff_host || !ctx->cmp_host)
++    ctx->diff_int  = av_calloc((size_t)ctx->diff_stride * IVTC_CYCLE, sizeof(cl_int));
++    ctx->cmp_host  = av_malloc_array(s->nwg, 6 * sizeof(cl_int));
++    if (!ctx->diff_host || !ctx->diff_int || !ctx->cmp_host)
 +        return AVERROR(ENOMEM);
 +
 +    // Constant kernel args (indices match the signatures in opencl/ivtc.cl).
@@ -270,14 +272,14 @@ libavfilter/opencl_source.h.
 +// ---- kernel launches ------------------------------------------------------
 +
 +// compare_fields accumulators (C vs P) in three chained kernels, then one
-+// blocking readback of the per-WG partials, summed here.
++// blocking readback of the per-block sums, summed here.
 +static int ivtc_cl_match_accum(AVFilterContext *avctx, AVFrame *prevf, AVFrame *curf,
 +                               AVFrame *nextf, int tff, double A[3], double B[3])
 +{
 +    IvtcOpenCLContext *ctx = avctx->priv;
 +    IVTCContext *s = &ctx->ivtc;
 +    cl_mem prev = (cl_mem)prevf->data[0], cur = (cl_mem)curf->data[0];
-+    cl_int cle, ctff = tff;
++    cl_int cle, ctff = tff, zero = 0;
 +    size_t gf[2]  = { (size_t)s->luma_w, (size_t)s->luma_hf };
 +    size_t gw[2]  = { (size_t)s->nwgx * IVTC_WG, (size_t)s->nwgy * IVTC_WG };
 +    size_t loc[2] = { IVTC_WG, IVTC_WG };
@@ -299,11 +301,14 @@ libavfilter/opencl_source.h.
 +        (err = ivtc_set_arg(avctx, ctx->kernel_compare, 1, sizeof(cl_mem), &prev)) < 0 ||
 +        (err = ivtc_set_arg(avctx, ctx->kernel_compare, 4, sizeof(cl_int), &ctff)) < 0)
 +        return err;
++    cle = clEnqueueFillBuffer(ctx->command_queue, ctx->cmp_buf, &zero, sizeof(zero), 0,
++                              s->nwg * 6 * sizeof(cl_int), 0, NULL, NULL);
++    if (cle != CL_SUCCESS) { av_log(avctx, AV_LOG_ERROR, "cmp clear: %d.\n", cle); return AVERROR(EIO); }
 +    cle = clEnqueueNDRangeKernel(ctx->command_queue, ctx->kernel_compare, 2, NULL, gw, loc, 0, NULL, NULL);
 +    if (cle != CL_SUCCESS) { av_log(avctx, AV_LOG_ERROR, "compare enqueue: %d.\n", cle); return AVERROR(EIO); }
 +
 +    cle = clEnqueueReadBuffer(ctx->command_queue, ctx->cmp_buf, CL_TRUE, 0,
-+                              s->nwg * 6 * sizeof(cl_float), ctx->cmp_host, 0, NULL, NULL);
++                              s->nwg * 6 * sizeof(cl_int), ctx->cmp_host, 0, NULL, NULL);
 +    if (cle != CL_SUCCESS) { av_log(avctx, AV_LOG_ERROR, "cmp readback: %d.\n", cle); return AVERROR(EIO); }
 +
 +    for (i = 0; i < s->nwg; i++) {
@@ -341,18 +346,21 @@ libavfilter/opencl_source.h.
 +    return 0;
 +}
 +
-+// ivtc_diff emits one abs-diff sum per 16x16 block (work-group) into its slice;
++// ivtc_diff emits one abs-diff sum per 16x16 block into its slice;
 +// all launches are enqueued first, then ONE blocking read of the whole buffer.
 +static int ivtc_cl_diff_cycle(AVFilterContext *avctx, AVFrame *const a[IVTC_CYCLE],
 +                              AVFrame *const b[IVTC_CYCLE], const float **sums, int *stride)
 +{
 +    IvtcOpenCLContext *ctx = avctx->priv;
 +    IVTCContext *s = &ctx->ivtc;
-+    size_t global[2] = { (size_t)s->nwgx * IVTC_WG, (size_t)s->nwgy * IVTC_WG };
-+    size_t local[2]  = { IVTC_WG, IVTC_WG };
-+    cl_int cle;
++    size_t global[2] = { (size_t)s->nwgx, (size_t)s->luma_h };
++    size_t len = (size_t)(IVTC_CYCLE - 1) * ctx->diff_stride + s->nwg;
++    cl_int cle, zero = 0;
 +    int err, i;
 +
++    cle = clEnqueueFillBuffer(ctx->command_queue, ctx->diff_buf, &zero, sizeof(zero), 0,
++                              len * sizeof(cl_int), 0, NULL, NULL);
++    if (cle != CL_SUCCESS) { av_log(avctx, AV_LOG_ERROR, "diff clear: %d.\n", cle); return AVERROR(EIO); }
 +    for (i = 0; i < IVTC_CYCLE; i++) {
 +        cl_mem ma, mb;
 +        if (!b[i])
@@ -364,13 +372,14 @@ libavfilter/opencl_source.h.
 +            (err = ivtc_set_arg(avctx, ctx->kernel_diff, 4, sizeof(cl_mem), &ctx->diff_sub[i])) < 0)
 +            return err;
 +        cle = clEnqueueNDRangeKernel(ctx->command_queue, ctx->kernel_diff, 2, NULL,
-+                                     global, local, 0, NULL, NULL);
++                                     global, NULL, 0, NULL, NULL);
 +        if (cle != CL_SUCCESS) { av_log(avctx, AV_LOG_ERROR, "diff enqueue: %d.\n", cle); return AVERROR(EIO); }
 +    }
 +    cle = clEnqueueReadBuffer(ctx->command_queue, ctx->diff_buf, CL_TRUE, 0,
-+                              ((size_t)(IVTC_CYCLE - 1) * ctx->diff_stride + s->nwg) * sizeof(cl_float),
-+                              ctx->diff_host, 0, NULL, NULL);
++                              len * sizeof(cl_int), ctx->diff_int, 0, NULL, NULL);
 +    if (cle != CL_SUCCESS) { av_log(avctx, AV_LOG_ERROR, "diff readback: %d.\n", cle); return AVERROR(EIO); }
++    for (size_t k = 0; k < len; k++)
++        ctx->diff_host[k] = ctx->diff_int[k] / 65535.0f;
 +
 +    *sums   = ctx->diff_host;
 +    *stride = ctx->diff_stride;
@@ -480,6 +489,7 @@ libavfilter/opencl_source.h.
 +    ff_ivtc_uninit_common(avctx);
 +
 +    av_freep(&ctx->diff_host);
++    av_freep(&ctx->diff_int);
 +    av_freep(&ctx->cmp_host);
 +    for (i = 0; i < IVTC_CYCLE; i++)
 +        if (ctx->diff_sub[i]) clReleaseMemObject(ctx->diff_sub[i]);
@@ -540,7 +550,7 @@ libavfilter/opencl_source.h.
 +};
 --- /dev/null
 +++ b/libavfilter/opencl/ivtc.cl
-@@ -0,0 +1,325 @@
+@@ -0,0 +1,307 @@
 +/*
 + * Copyright (c) 2026
 + *
@@ -700,35 +710,29 @@ libavfilter/opencl_source.h.
 +
 +/*
 + * Luma SAD between two frames for decimation duplicate detection. Each
-+ * work-group writes its partial sum to diffs[wg]; the host sums them.
++ * work-item adds the SAD of one 16-pixel row segment, in 16-bit sample units,
++ * to its 16x16 block's diffs[block]; the host sums them.
 + */
 +// args: 0=a 1=b 2=width 3=height 4=diffs
-+__attribute__((reqd_work_group_size(IVTC_WG, IVTC_WG, 1)))
 +__kernel void ivtc_diff(__read_only image2d_t a,
 +                        __read_only image2d_t b,
 +                        int width, int height,
-+                        __global float *diffs)
++                        __global int *diffs)
 +{
-+    int x   = get_global_id(0);
-+    int y   = get_global_id(1);
-+    int tid = get_local_id(1) * IVTC_WG + get_local_id(0);
++    int bx = get_global_id(0);
++    int y  = get_global_id(1);
++    int x1 = min((bx + 1) * IVTC_WG, width);
++    int d  = 0;
 +
-+    float d = 0.0f;
-+    if (x < width && y < height)
-+        d = fabs(read_imagef(a, ivtc_samp, (int2)(x, y)).x -
-+                 read_imagef(b, ivtc_samp, (int2)(x, y)).x);
-+
-+    __local float l[IVTC_WG * IVTC_WG];
-+    l[tid] = d;
-+    barrier(CLK_LOCAL_MEM_FENCE);
-+    for (int s = (IVTC_WG * IVTC_WG) / 2; s > 0; s >>= 1) {
-+        if (tid < s) l[tid] += l[tid + s];
-+        barrier(CLK_LOCAL_MEM_FENCE);
++    if (y >= height)
++        return;
++    for (int x = bx * IVTC_WG; x < x1; x++) {
++        int va = (int)rint(read_imagef(a, ivtc_samp, (int2)(x, y)).x * 65535.0f);
++        int vb = (int)rint(read_imagef(b, ivtc_samp, (int2)(x, y)).x * 65535.0f);
++        d += abs(va - vb);
 +    }
-+    if (tid == 0) {
-+        int wg = get_group_id(1) * get_num_groups(0) + get_group_id(0);
-+        diffs[wg] = l[0];
-+    }
++    if (d)
++        atomic_add(&diffs[(y / IVTC_WG) * (int)get_global_size(0) + bx], d);
 +}
 +
 +/* =====================================================================
@@ -816,55 +820,43 @@ libavfilter/opencl_source.h.
 +    F[fy * width + x] = f;
 +}
 +
-+// compare_fields accumulation for match1=C (cur) vs match2=cand. Each WG writes
-+// 6 partials: {Ac,Am,Aml, Bc,Bm,Bml} -> out[wg*6 + 0..5]; host sums + decides.
++static int fm_luma_int(__read_only image2d_t im, int x, int y)
++{
++    return (int)rint(fm_luma(im, x, y));
++}
++
++// compare_fields accumulation for match1=C (cur) vs match2=cand. Each block accumulates
++// 6 sums: {Ac,Am,Aml, Bc,Bm,Bml} -> out[wg*6 + 0..5]; host sums + decides.
 +// args: 0=cur 1=cand 2=width 3=height 4=tff 5=F 6=hf 7=out
 +__attribute__((reqd_work_group_size(IVTC_WG, IVTC_WG, 1)))
 +__kernel void fm_compare_accum(__read_only image2d_t cur,
 +                               __read_only image2d_t cand,
 +                               int width, int height, int tff,
 +                               __global const uchar *F, int hf,
-+                               __global float *out)
++                               __global int *out)
 +{
 +    int x   = get_global_id(0);
 +    int y   = get_global_id(1);
-+    int tid = get_local_id(1) * IVTC_WG + get_local_id(0);
 +    int kp  = tff ? 0 : 1;             // kept parity
 +    int bf  = tff ? 1 : 0;             // borrowed parity
 +
-+    float Ac = 0, Am = 0, Aml = 0, Bc = 0, Bm = 0, Bml = 0;
-+    if (x >= 8 && x < width - 8 && (y & 1) == kp && y >= 2 && y < height - 2) {
-+        float t1 = fm_luma(cur, x, y - 2) + 4.0f * fm_luma(cur, x, y) + fm_luma(cur, x, y + 2);
-+        float a  = fabs(3.0f * (fm_luma(cur,  x, y - 1) + fm_luma(cur,  x, y + 1)) - t1);
-+        float b  = fabs(3.0f * (fm_luma(cand, x, y - 1) + fm_luma(cand, x, y + 1)) - t1);
-+        // mask flags at the two borrowed field rows adjacent to kept row y
-+        int fa = (y - 1 - bf) >> 1, fb = (y + 1 - bf) >> 1;
-+        int m = 0;
-+        if (fa >= 0 && fa < hf) m |= F[fa * width + x];
-+        if (fb >= 0 && fb < hf) m |= F[fb * width + x];
-+        if (a > 23.0f && (m & 1)) Ac += a;
-+        if (a > 42.0f) { if (m & 2) Am += a; if (m & 4) Aml += a; }
-+        if (b > 23.0f && (m & 1)) Bc += b;
-+        if (b > 42.0f) { if (m & 2) Bm += b; if (m & 4) Bml += b; }
-+    }
-+
-+    __local float l[IVTC_WG * IVTC_WG * 6];
-+    // planar layout l[k*NT + tid] (avoids stride-6 bank conflicts)
-+    const int NT = IVTC_WG * IVTC_WG;
-+    l[0*NT+tid]=Ac; l[1*NT+tid]=Am; l[2*NT+tid]=Aml;
-+    l[3*NT+tid]=Bc; l[4*NT+tid]=Bm; l[5*NT+tid]=Bml;
-+    barrier(CLK_LOCAL_MEM_FENCE);
-+    for (int s = (IVTC_WG * IVTC_WG) / 2; s > 0; s >>= 1) {
-+        if (tid < s)
-+            for (int k = 0; k < 6; k++)
-+                l[k*NT+tid] += l[k*NT+tid+s];
-+        barrier(CLK_LOCAL_MEM_FENCE);
-+    }
-+    if (tid == 0) {
-+        int wg = get_group_id(1) * get_num_groups(0) + get_group_id(0);
-+        for (int k = 0; k < 6; k++)
-+            out[wg*6+k] = l[k*NT];
-+    }
++    if (x < 8 || x >= width - 8 || (y & 1) != kp || y < 2 || y >= height - 2)
++        return;
++    // mask flags at the two borrowed field rows adjacent to kept row y
++    int fa = (y - 1 - bf) >> 1, fb = (y + 1 - bf) >> 1;
++    int m = 0;
++    if (fa >= 0 && fa < hf) m |= F[fa * width + x];
++    if (fb >= 0 && fb < hf) m |= F[fb * width + x];
++    if (!m)
++        return;
++    int t1 = fm_luma_int(cur, x, y - 2) + 4 * fm_luma_int(cur, x, y) + fm_luma_int(cur, x, y + 2);
++    int a  = abs(3 * (fm_luma_int(cur,  x, y - 1) + fm_luma_int(cur,  x, y + 1)) - t1);
++    int b  = abs(3 * (fm_luma_int(cand, x, y - 1) + fm_luma_int(cand, x, y + 1)) - t1);
++    __global int *o = out + (get_group_id(1) * get_num_groups(0) + get_group_id(0)) * 6;
++    if (a > 23 && (m & 1)) atomic_add(&o[0], a);
++    if (a > 42) { if (m & 2) atomic_add(&o[1], a); if (m & 4) atomic_add(&o[2], a); }
++    if (b > 23 && (m & 1)) atomic_add(&o[3], b);
++    if (b > 42) { if (m & 2) atomic_add(&o[4], b); if (m & 4) atomic_add(&o[5], b); }
 +}
 --- a/libavfilter/allfilters.c
 +++ b/libavfilter/allfilters.c
